@@ -1,0 +1,25 @@
+# Core ML/DL Libraries
+torch>=2.0.0
+transformers>=4.37.0
+accelerate>=0.26.0
+
+# Qwen VL specific
+qwen-vl-utils>=0.0.8
+
+# Vision processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Web Interface
+gradio>=4.0.0
+
+# Optional: Performance optimizations
+# flash-attn>=2.3.0  # Uncomment if you have CUDA and want Flash Attention
+
+# Utilities
+tqdm>=4.65.0
