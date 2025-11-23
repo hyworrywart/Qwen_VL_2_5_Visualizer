@@ -146,33 +146,58 @@ class AttentionProcessor:
         Returns:
             1D tensor of attention values for vision tokens, or None
         """
+        print(f"[get_attention_to_vision_tokens] Token position: {token_position}")
+        print(f"[get_attention_to_vision_tokens] Image token ranges: {self.vision_token_ranges['image']}")
+        
         if not self.vision_token_ranges['image']:
+            print("[get_attention_to_vision_tokens] ERROR: No image token ranges found")
             return None
 
         # Aggregate attention across layers and heads
+        print(f"[get_attention_to_vision_tokens] Aggregating attention with method: {aggregation_method}")
         aggregated_attn = utils.aggregate_attention(
             attention_weights,
             layer_indices=layer_indices,
             head_indices=head_indices,
             aggregation_method=aggregation_method
         )
+        
+        print(f"[get_attention_to_vision_tokens] Aggregated attention shape: {aggregated_attn.shape}")
 
         # Extract attention from token_position to all positions
-        # aggregated_attn shape: (seq_len, seq_len)
-        if token_position >= aggregated_attn.size(0):
+        # In autoregressive generation, attention may be (1, seq_len) for a single token
+        # or (seq_len, seq_len) for full sequence
+        if aggregated_attn.dim() == 2:
+            if aggregated_attn.size(0) == 1:
+                # Single token attention: shape is (1, seq_len)
+                # This is the attention from the current token to all previous tokens
+                print(f"[get_attention_to_vision_tokens] Single token attention detected")
+                attention_from_token = aggregated_attn[0, :]
+            elif token_position < aggregated_attn.size(0):
+                # Full attention matrix: shape is (seq_len, seq_len)
+                print(f"[get_attention_to_vision_tokens] Full attention matrix detected")
+                attention_from_token = aggregated_attn[token_position, :]
+            else:
+                print(f"[get_attention_to_vision_tokens] ERROR: token_position {token_position} >= seq_len {aggregated_attn.size(0)}")
+                return None
+        else:
+            print(f"[get_attention_to_vision_tokens] ERROR: Unexpected attention shape: {aggregated_attn.shape}")
             return None
-
-        attention_from_token = aggregated_attn[token_position, :]
+            
+        print(f"[get_attention_to_vision_tokens] Attention from token shape: {attention_from_token.shape}")
 
         # Extract attention to vision tokens only
         vision_attention_list = []
         for start, end in self.vision_token_ranges['image']:
+            print(f"[get_attention_to_vision_tokens] Extracting vision tokens from {start} to {end}")
             vision_attention_list.append(attention_from_token[start:end])
 
         if vision_attention_list:
             vision_attention = torch.cat(vision_attention_list)
+            print(f"[get_attention_to_vision_tokens] Final vision attention shape: {vision_attention.shape}")
             return vision_attention
 
+        print("[get_attention_to_vision_tokens] ERROR: No vision attention extracted")
         return None
 
     def create_attention_map(
@@ -192,16 +217,23 @@ class AttentionProcessor:
         Returns:
             2D numpy array representing attention map, or None
         """
+        print(f"[create_attention_map] Creating map for image_idx: {image_idx}")
+        print(f"[create_attention_map] Patch mapping exists: {self.patch_mapping is not None}")
+        print(f"[create_attention_map] Image grid thw exists: {self.image_grid_thw is not None}")
+        
         if self.patch_mapping is None or self.image_grid_thw is None:
+            print("[create_attention_map] ERROR: patch_mapping or image_grid_thw is None")
             return None
 
         if image_idx >= len(self.image_grid_thw):
+            print(f"[create_attention_map] ERROR: image_idx {image_idx} >= num_images {len(self.image_grid_thw)}")
             return None
 
         # Get grid dimensions
         t, h, w = self.image_grid_thw[image_idx]
         grid_h = h.item() // config.SPATIAL_MERGE_SIZE
         grid_w = w.item() // config.SPATIAL_MERGE_SIZE
+        print(f"[create_attention_map] Grid dimensions: t={t}, h={h}, w={w}, grid_h={grid_h}, grid_w={grid_w}")
 
         # For videos/temporal, we'll average across time
         # For simplicity, we'll create a 2D map for the first frame
@@ -209,10 +241,13 @@ class AttentionProcessor:
 
         # Get token range for this image
         if image_idx >= len(self.vision_token_ranges['image']):
+            print(f"[create_attention_map] ERROR: image_idx {image_idx} >= num_image_ranges {len(self.vision_token_ranges['image'])}")
             return None
 
         start, end = self.vision_token_ranges['image'][image_idx]
         num_tokens = end - start
+        print(f"[create_attention_map] Vision token range: {start} to {end} ({num_tokens} tokens)")
+        print(f"[create_attention_map] Vision attention length: {len(vision_attention)}")
 
         # Fill in attention values
         attention_values = vision_attention[:num_tokens].cpu().numpy()
@@ -224,14 +259,21 @@ class AttentionProcessor:
                 if row < grid_h and col < grid_w and token_count < len(attention_values):
                     attention_map[row, col] = attention_values[token_count]
                     token_count += 1
+        
+        print(f"[create_attention_map] Filled {token_count} tokens into attention map")
 
         # Normalize if requested
         if normalize:
             min_val = attention_map.min()
             max_val = attention_map.max()
+            print(f"[create_attention_map] Attention range before norm: [{min_val}, {max_val}]")
             if max_val - min_val > 1e-8:
                 attention_map = (attention_map - min_val) / (max_val - min_val)
+                print(f"[create_attention_map] Normalized attention map")
+            else:
+                print(f"[create_attention_map] WARNING: Attention values are constant, skipping normalization")
 
+        print(f"[create_attention_map] Final attention map shape: {attention_map.shape}")
         return attention_map
 
     def get_attention_heatmap_for_token(
@@ -264,6 +306,12 @@ class AttentionProcessor:
         Returns:
             2D numpy array representing attention heatmap
         """
+        print(f"[AttentionProcessor] Getting attention heatmap for token at position {token_position}")
+        print(f"[AttentionProcessor] Vision token ranges: {self.vision_token_ranges}")
+        print(f"[AttentionProcessor] Patch mapping exists: {self.patch_mapping is not None}")
+        if self.patch_mapping:
+            print(f"[AttentionProcessor] Patch mapping size: {len(self.patch_mapping)}")
+        
         # Get attention to vision tokens
         vision_attention = self.get_attention_to_vision_tokens(
             attention_weights,
@@ -274,7 +322,10 @@ class AttentionProcessor:
         )
 
         if vision_attention is None:
+            print("[AttentionProcessor] ERROR: vision_attention is None")
             return None
+        
+        print(f"[AttentionProcessor] Vision attention shape: {vision_attention.shape}")
 
         # Create 2D attention map
         attention_map = self.create_attention_map(
@@ -282,6 +333,12 @@ class AttentionProcessor:
             image_idx,
             normalize
         )
+
+        if attention_map is None:
+            print("[AttentionProcessor] ERROR: attention_map is None")
+            return None
+        
+        print(f"[AttentionProcessor] Created attention map with shape: {attention_map.shape}")
 
         return attention_map
 

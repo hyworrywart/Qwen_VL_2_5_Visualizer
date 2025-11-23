@@ -10,8 +10,8 @@ from pathlib import Path
 # =============================================================================
 
 # Model identifiers
-MODEL_NAME = "Qwen/Qwen2.5-VL-3B-Instruct"
-PROCESSOR_NAME = "Qwen/Qwen2.5-VL-7B-Instruct"  # Processor is compatible across sizes
+MODEL_NAME = "/data/yuwei_hu/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/Qwen2.5-VL-7B-Instruct"
+PROCESSOR_NAME = "/data/yuwei_hu/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/Qwen2.5-VL-7B-Instruct"  # Processor is compatible across sizes
 
 # Model loading parameters
 MODEL_DEVICE_MAP = "auto"  # Auto-assign layers to available devices

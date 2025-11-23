@@ -70,7 +70,8 @@ def load_model():
         state.model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             config.MODEL_NAME,
             torch_dtype=config.MODEL_TORCH_DTYPE,
-            device_map=config.MODEL_DEVICE_MAP
+            device_map=config.MODEL_DEVICE_MAP,
+            attn_implementation="eager"  # Required for output_attentions support
         )
 
         print(f"Loading processor: {config.PROCESSOR_NAME}")
@@ -84,8 +85,13 @@ def load_model():
             specific_layers=config.SPECIFIC_LAYERS
         )
 
+        # Get actual model architecture info
+        num_layers = len(state.model.model.language_model.layers)
+        print(f"Model architecture: {num_layers} layers")
+        print(f"Target layers for attention extraction: {state.extractor.target_layers}")
+
         print("Model loaded successfully!")
-        return "✓ Model loaded successfully!"
+        return f"✓ Model loaded successfully! ({num_layers} layers)"
 
     except Exception as e:
         error_msg = f"Error loading model: {str(e)}"
@@ -108,13 +114,16 @@ def generate_with_attention(
     Generate text from image with attention extraction.
 
     Returns:
-        Tuple of (generated_text, status_message, token_info_dict)
+        Tuple of (generated_text, status_message, token_selector_update,
+                 layer_start_update, layer_end_update, head_start_update, head_end_update)
     """
     if state.model is None:
-        return "", "Please load the model first!", {}
+        return ("", "Please load the model first!", gr.update(choices=[], value=None),
+                gr.update(), gr.update(), gr.update(), gr.update())
 
     if image is None:
-        return "", "Please upload an image!", {}
+        return ("", "Please upload an image!", gr.update(choices=[], value=None),
+                gr.update(), gr.update(), gr.update(), gr.update())
 
     try:
         # Reset previous state
@@ -174,8 +183,28 @@ def generate_with_attention(
 
         state.extractor.stop_extraction()
 
-        # Get attention weights
-        state.current_attention = state.extractor.get_attention_weights()
+        # Get attention weights for ALL generation steps
+        state.current_attention = state.extractor.get_all_generation_steps()
+        
+        # Debug: Print extracted attention info
+        print(f"Extracted attention from {len(state.current_attention)} generation steps")
+        if state.current_attention:
+            step_keys = sorted(state.current_attention.keys())
+            print(f"Step keys (sequence lengths): {step_keys}")
+            
+            sample_step = step_keys[0]
+            sample_layer = list(state.current_attention[sample_step].keys())[0]
+            num_layers = len(state.current_attention[sample_step])
+            num_heads = len(state.current_attention[sample_step][sample_layer])
+            
+            print(f"Layer indices: {sorted(state.current_attention[sample_step].keys())}")
+            print(f"Number of heads per layer: {num_heads}")
+            
+            # Show attention shape for each step
+            print(f"\nAttention shapes by step:")
+            for step in step_keys[:min(5, len(step_keys))]:  # Show first 5 steps
+                sample_attn = state.current_attention[step][sample_layer][0]
+                print(f"  Step {step}: {sample_attn.shape}")
 
         # Decode output
         generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
@@ -202,26 +231,69 @@ def generate_with_attention(
 
         # Log info
         if config.VERBOSE:
-            utils.log_attention_info(state.current_attention)
+            # Log attention info for new data structure
+            print(f"\n{'='*60}")
+            print(f"Attention Extraction Summary")
+            print(f"{'='*60}")
+            print(f"Number of generation steps: {len(state.current_attention)}")
+            if state.current_attention:
+                first_step = min(state.current_attention.keys())
+                first_step_data = state.current_attention[first_step]
+                print(f"Number of layers: {len(first_step_data)}")
+                sample_layer = list(first_step_data.keys())[0]
+                print(f"Number of heads: {len(first_step_data[sample_layer])}")
+                sample_head = list(first_step_data[sample_layer].keys())[0]
+                print(f"Sample attention shape: {first_step_data[sample_layer][sample_head].shape}")
+            print(f"{'='*60}\n")
+            
             info = state.current_processor.get_sequence_info()
             print(f"Sequence info: {info}")
 
         # Create token choices for dropdown
-        token_choices = {
-            f"Token {i}: '{tok}'": i
+        token_choices = [
+            f"Token {i}: '{tok}'"
             for i, tok in enumerate(state.current_tokens)
-        }
+        ]
 
         status = f"✓ Generated {len(generated_ids)} tokens successfully!"
 
-        return generated_text, status, token_choices
+        # Return dropdown update with choices and select first token by default
+        dropdown_update = gr.update(
+            choices=token_choices,
+            value=token_choices[0] if token_choices else None
+        )
+        
+        # Get actual layer and head counts for UI updates
+        # Use the first generation step to get layer/head info
+        first_step = min(state.current_attention.keys())
+        first_step_attn = state.current_attention[first_step]
+        
+        available_layers = sorted(first_step_attn.keys())
+        sample_layer = available_layers[0]
+        available_heads = sorted(first_step_attn[sample_layer].keys())
+        
+        max_layer = max(available_layers)
+        max_head = max(available_heads)
+        
+        # Update layer sliders
+        layer_start_update = gr.update(maximum=max_layer, value=max(0, max_layer - 4))
+        layer_end_update = gr.update(maximum=max_layer, value=max_layer)
+        
+        # Update head sliders  
+        head_start_update = gr.update(maximum=max_head, value=0)
+        head_end_update = gr.update(maximum=max_head, value=max_head)
+
+        return (generated_text, status, dropdown_update, 
+                layer_start_update, layer_end_update,
+                head_start_update, head_end_update)
 
     except Exception as e:
         error_msg = f"Error during generation: {str(e)}"
         print(error_msg)
         import traceback
         traceback.print_exc()
-        return "", f"✗ {error_msg}", {}
+        return ("", f"✗ {error_msg}", gr.update(choices=[], value=None),
+                gr.update(), gr.update(), gr.update(), gr.update())
 
 
 # =============================================================================
@@ -254,25 +326,101 @@ def visualize_token_attention(
     Returns:
         PIL Image with visualization
     """
+    # Check if generation has been done
     if state.current_attention is None or state.current_processor is None:
+        print("Error: No attention data available. Please generate text first.")
+        return None
+
+    # Check if a token is selected
+    if token_selector is None or token_selector == "":
+        print("Error: No token selected. Please select a token from the dropdown.")
         return None
 
     try:
         # Extract token index from selector string
         # Format: "Token {i}: '{tok}'"
+        print(f"Visualizing token: {token_selector}")
         token_idx = int(token_selector.split(":")[0].split()[-1])
 
         # Adjust token position (account for input tokens)
         input_length = state.current_input_ids.shape[1]
         absolute_token_position = input_length + token_idx
+        
+        # The step key is the total sequence length at the time this token was generated
+        # = input_length + token_idx + 1 (because we're generating the (token_idx+1)-th new token)
+        step_key = absolute_token_position
+        
+        print(f"Token index: {token_idx}, Input length: {input_length}, Absolute position: {absolute_token_position}")
+        print(f"Looking for attention at step key (sequence length): {step_key}")
+        print(f"Available step keys: {sorted(state.current_attention.keys())}")
+        
+        # Get attention for this specific generation step
+        if step_key not in state.current_attention:
+            print(f"ERROR: Step key {step_key} not found in attention data")
+            # Try to find the closest step
+            available_keys = sorted(state.current_attention.keys())
+            if available_keys:
+                closest_key = min(available_keys, key=lambda x: abs(x - step_key))
+                print(f"Using closest available step: {closest_key}")
+                step_attention = state.current_attention[closest_key]
+            else:
+                print("ERROR: No attention data available")
+                return None
+        else:
+            step_attention = state.current_attention[step_key]
 
-        # Get layer and head indices
-        layer_indices = list(range(layer_start, layer_end + 1)) if layer_end >= layer_start else None
-        head_indices = list(range(head_start, head_end + 1)) if head_end >= head_start else None
+        # Get available layers and heads from this step
+        available_layers = sorted(step_attention.keys())
+        if not available_layers:
+            print("ERROR: No attention data available")
+            return None
+        
+        sample_layer = available_layers[0]
+        available_heads = sorted(step_attention[sample_layer].keys())
+        
+        print(f"Available layers: {available_layers}")
+        print(f"Available heads: {available_heads}")
+        print(f"Requested layer range: {layer_start}-{layer_end}")
+        print(f"Requested head range: {head_start}-{head_end}")
+        
+        # Validate and constrain layer indices
+        valid_layer_start = max(layer_start, min(available_layers))
+        valid_layer_end = min(layer_end, max(available_layers))
+        
+        if valid_layer_start > valid_layer_end:
+            print(f"ERROR: Invalid layer range. Available: {min(available_layers)}-{max(available_layers)}")
+            return None
+            
+        layer_indices = list(range(valid_layer_start, valid_layer_end + 1))
+        layer_indices = [l for l in layer_indices if l in available_layers]
+        
+        # Validate and constrain head indices
+        valid_head_start = max(head_start, min(available_heads))
+        valid_head_end = min(head_end, max(available_heads))
+        
+        if valid_head_start > valid_head_end:
+            print(f"ERROR: Invalid head range. Available: {min(available_heads)}-{max(available_heads)}")
+            return None
+            
+        head_indices = list(range(valid_head_start, valid_head_end + 1))
+        head_indices = [h for h in head_indices if h in available_heads]
+        
+        print(f"Using layers: {layer_indices}")
+        print(f"Using heads: {head_indices}")
 
-        # Get attention heatmap
+        # Debug processor info
+        print(f"Processor info:")
+        print(f"  - Has patch_mapping: {state.current_processor.patch_mapping is not None}")
+        print(f"  - Has image_grid_thw: {state.current_processor.image_grid_thw is not None}")
+        print(f"  - Vision token ranges: {state.current_processor.vision_token_ranges}")
+        
+        if state.current_processor.image_grid_thw is not None:
+            print(f"  - Image grid THW: {state.current_processor.image_grid_thw}")
+        
+        # Get attention heatmap using the attention from this specific generation step
+        print("Getting attention heatmap...")
         attention_map = state.current_processor.get_attention_heatmap_for_token(
-            state.current_attention,
+            step_attention,
             token_position=absolute_token_position,
             layer_indices=layer_indices,
             head_indices=head_indices,
@@ -281,24 +429,34 @@ def visualize_token_attention(
         )
 
         if attention_map is None:
-            print("No attention map generated")
+            print("ERROR: No attention map generated")
+            print("Possible causes:")
+            print("  1. No vision tokens found in sequence")
+            print("  2. Patch mapping failed")
+            print("  3. Token position out of range")
             return None
 
+        print(f"Attention map shape: {attention_map.shape}")
+
         # Create visualization
+        print(f"Creating visualization with colormap={colormap}, alpha={alpha}")
         visualizer = AttentionVisualizer(colormap=colormap, alpha=alpha)
 
         if show_comparison:
+            print("Creating side-by-side comparison...")
             result = visualizer.create_side_by_side_comparison(
                 state.current_image,
                 attention_map,
                 titles=("Original Image", f"Attention: {token_selector}")
             )
         else:
+            print("Creating heatmap overlay...")
             result = visualizer.create_heatmap_overlay(
                 state.current_image,
                 attention_map
             )
 
+        print("Visualization created successfully!")
         return result
 
     except Exception as e:
@@ -315,10 +473,11 @@ def visualize_token_attention(
 def create_interface():
     """Create the Gradio interface."""
 
-    # Get model info
-    num_layers, num_heads = 80, 64  # Default for 3B model
+    # Get model info - will be updated after model loads
+    # These are placeholder values, actual values set dynamically
+    num_layers, num_heads = 28, 28  # Default for 7B model (will be updated)
 
-    with gr.Blocks(title="Qwen2.5-VL Attention Visualizer", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Qwen2.5-VL Attention Visualizer") as demo:
         gr.Markdown("""
         # 🔍 Qwen2.5-VL Attention Visualization Tool
 
@@ -442,7 +601,8 @@ def create_interface():
         generate_btn.click(
             fn=generate_with_attention,
             inputs=[image_input, prompt_input, max_tokens, temperature, top_p],
-            outputs=[output_text, gen_status, token_selector]
+            outputs=[output_text, gen_status, token_selector, 
+                    layer_start, layer_end, head_start, head_end]
         )
 
         visualize_btn.click(

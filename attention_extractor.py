@@ -53,7 +53,7 @@ class AttentionHook:
 
             if attn_weights is not None:
                 # Store attention weights
-                # Shape: (batch_size, num_heads, seq_len, seq_len)
+                # Shape: (batch_size, num_heads, seq_len, seq_len) or (batch_size, num_heads, 1, seq_len)
                 if self.use_float16:
                     attn_weights = attn_weights.half()
 
@@ -61,24 +61,51 @@ class AttentionHook:
                     attn_weights = attn_weights.cpu()
 
                 # Store per head
-                batch_size, num_heads, seq_len, _ = attn_weights.shape
+                batch_size, num_heads, query_len, key_len = attn_weights.shape
+                
+                # Use key_len (total sequence length) to determine generation step
+                # In autoregressive generation, each new token sees all previous tokens
+                # So generation_step = key_len - input_length
+                # For now, use key_len as a unique identifier
+                step_key = key_len
+                
                 for head_idx in range(num_heads):
-                    key = (self.generation_step, head_idx)
+                    key = (step_key, head_idx)
                     self.attention_weights[key] = attn_weights[0, head_idx].clone()
 
-    def get_attention_weights(self) -> Dict[int, torch.Tensor]:
+    def get_attention_weights(self, generation_step: Optional[int] = None) -> Dict[int, torch.Tensor]:
         """
-        Get stored attention weights for all heads at current generation step.
+        Get stored attention weights for all heads at a specific generation step.
+
+        Args:
+            generation_step: Which generation step to retrieve (None = last step)
 
         Returns:
             Dictionary mapping head_idx to attention tensor
         """
+        if generation_step is None:
+            generation_step = self.generation_step
+            
         current_step_attn = {}
         for (step, head_idx), attn in self.attention_weights.items():
-            if step == self.generation_step:
+            if step == generation_step:
                 current_step_attn[head_idx] = attn
 
         return current_step_attn
+    
+    def get_all_attention_weights(self) -> Dict[int, Dict[int, torch.Tensor]]:
+        """
+        Get attention weights for all generation steps, organized by step then head.
+        
+        Returns:
+            Dictionary: {step: {head_idx: attention_tensor}}
+        """
+        all_attn = {}
+        for (step, head_idx), attn in self.attention_weights.items():
+            if step not in all_attn:
+                all_attn[step] = {}
+            all_attn[step][head_idx] = attn
+        return all_attn
 
     def increment_step(self):
         """Increment the generation step counter."""
@@ -210,7 +237,7 @@ class AttentionExtractor:
 
     def get_attention_weights(self) -> Dict[int, Dict[int, torch.Tensor]]:
         """
-        Get all extracted attention weights.
+        Get all extracted attention weights from the last generation step.
 
         Returns:
             Dictionary: {layer_idx: {head_idx: attention_tensor}}
@@ -221,6 +248,45 @@ class AttentionExtractor:
             attention_dict[layer_idx] = hook.get_attention_weights()
 
         return attention_dict
+    
+    def get_attention_for_generation_step(self, step: int) -> Dict[int, Dict[int, torch.Tensor]]:
+        """
+        Get attention weights for a specific generation step.
+        
+        Args:
+            step: Generation step index
+            
+        Returns:
+            Dictionary: {layer_idx: {head_idx: attention_tensor}}
+        """
+        attention_dict = {}
+        
+        for layer_idx, hook in self.hooks.items():
+            attention_dict[layer_idx] = hook.get_attention_weights(generation_step=step)
+        
+        return attention_dict
+    
+    def get_all_generation_steps(self) -> Dict[int, Dict[int, Dict[int, torch.Tensor]]]:
+        """
+        Get attention weights for all generation steps.
+        
+        Returns:
+            Dictionary: {step: {layer_idx: {head_idx: attention_tensor}}}
+        """
+        # First get all attention by step from hooks
+        all_steps_by_layer = {}
+        for layer_idx, hook in self.hooks.items():
+            all_steps_by_layer[layer_idx] = hook.get_all_attention_weights()
+        
+        # Reorganize to {step: {layer: {head: attn}}}
+        all_steps = {}
+        for layer_idx, steps_dict in all_steps_by_layer.items():
+            for step, heads_dict in steps_dict.items():
+                if step not in all_steps:
+                    all_steps[step] = {}
+                all_steps[step][layer_idx] = heads_dict
+        
+        return all_steps
 
     def get_attention_for_token(
         self,
