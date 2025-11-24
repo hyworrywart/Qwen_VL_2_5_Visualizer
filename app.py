@@ -115,15 +115,20 @@ def generate_with_attention(
 
     Returns:
         Tuple of (generated_text, status_message, token_selector_update,
-                 layer_start_update, layer_end_update, head_start_update, head_end_update)
+                 layer_start_update, layer_end_update, head_start_update, head_end_update,
+                 token_range_display_html, token_range_start_idx, token_range_end_idx)
     """
+    empty_html = "<p style='color: gray;'>No tokens to display</p>"
+    
     if state.model is None:
         return ("", "Please load the model first!", gr.update(choices=[], value=None),
-                gr.update(), gr.update(), gr.update(), gr.update())
+                gr.update(), gr.update(), gr.update(), gr.update(), 
+                empty_html, 0, 0)
 
     if image is None:
         return ("", "Please upload an image!", gr.update(choices=[], value=None),
-                gr.update(), gr.update(), gr.update(), gr.update())
+                gr.update(), gr.update(), gr.update(), gr.update(), 
+                empty_html, 0, 0)
 
     try:
         # Reset previous state
@@ -282,23 +287,169 @@ def generate_with_attention(
         # Update head sliders  
         head_start_update = gr.update(maximum=max_head, value=0)
         head_end_update = gr.update(maximum=max_head, value=max_head)
+        
+        # Set initial token range values
+        num_tokens = len(state.current_tokens)
+        initial_start = 0
+        initial_end = min(4, num_tokens - 1)
+        
+        # Generate initial HTML display
+        initial_html = generate_token_display_html(
+            state.current_tokens,
+            start_idx=initial_start,
+            end_idx=initial_end
+        )
 
         return (generated_text, status, dropdown_update, 
                 layer_start_update, layer_end_update,
-                head_start_update, head_end_update)
+                head_start_update, head_end_update,
+                initial_html, initial_start, initial_end)
 
     except Exception as e:
         error_msg = f"Error during generation: {str(e)}"
         print(error_msg)
         import traceback
         traceback.print_exc()
+        error_html = "<p style='color: red;'>Error during generation</p>"
         return ("", f"✗ {error_msg}", gr.update(choices=[], value=None),
-                gr.update(), gr.update(), gr.update(), gr.update())
+                gr.update(), gr.update(), gr.update(), gr.update(), 
+                error_html, 0, 0)
 
 
 # =============================================================================
 # Visualization
 # =============================================================================
+
+def visualize_token_range_attention(
+    token_start_idx: int,
+    token_end_idx: int,
+    layer_start: int,
+    layer_end: int,
+    head_start: int,
+    head_end: int,
+    aggregation_method: str,
+    colormap: str,
+    alpha: float,
+    show_comparison: bool
+) -> Optional[Image.Image]:
+    """
+    Visualize aggregated attention for a range of tokens.
+    
+    Args:
+        token_start_idx: Start token index (inclusive)
+        token_end_idx: End token index (inclusive)
+        layer_start, layer_end: Layer range
+        head_start, head_end: Head range
+        aggregation_method: How to aggregate attention
+        colormap: Colormap name
+        alpha: Overlay transparency
+        show_comparison: Whether to show side-by-side comparison
+        
+    Returns:
+        PIL Image with visualization
+    """
+    if state.current_attention is None or state.current_processor is None:
+        print("Error: No attention data available. Please generate text first.")
+        return None
+    
+    if token_start_idx < 0 or token_end_idx < 0:
+        print("Error: Invalid token range")
+        return None
+    
+    try:
+        input_length = state.current_input_ids.shape[1]
+        
+        # Get available step keys
+        available_steps = sorted(state.current_attention.keys())
+        
+        print(f"Visualizing token range: {token_start_idx} to {token_end_idx}")
+        print(f"Input length: {input_length}")
+        
+        # Collect attention maps for all tokens in range
+        attention_maps = []
+        token_texts = []
+        
+        for token_idx in range(token_start_idx, token_end_idx + 1):
+            if token_idx >= len(state.current_tokens):
+                continue
+                
+            absolute_token_position = input_length + token_idx
+            step_key = absolute_token_position
+            
+            # Find closest step if exact match not found
+            if step_key not in state.current_attention:
+                if not available_steps:
+                    continue
+                step_key = min(available_steps, key=lambda x: abs(x - step_key))
+            
+            step_attention = state.current_attention[step_key]
+            
+            # Get available layers and heads
+            available_layers = sorted(step_attention.keys())
+            if not available_layers:
+                continue
+            
+            sample_layer = available_layers[0]
+            available_heads = sorted(step_attention[sample_layer].keys())
+            
+            # Validate and constrain indices
+            valid_layer_start = max(layer_start, min(available_layers))
+            valid_layer_end = min(layer_end, max(available_layers))
+            layer_indices = [l for l in range(valid_layer_start, valid_layer_end + 1) if l in available_layers]
+            
+            valid_head_start = max(head_start, min(available_heads))
+            valid_head_end = min(head_end, max(available_heads))
+            head_indices = [h for h in range(valid_head_start, valid_head_end + 1) if h in available_heads]
+            
+            # Get attention heatmap for this token
+            attention_map = state.current_processor.get_attention_heatmap_for_token(
+                step_attention,
+                token_position=absolute_token_position,
+                layer_indices=layer_indices,
+                head_indices=head_indices,
+                aggregation_method=aggregation_method.lower(),
+                normalize=True
+            )
+            
+            if attention_map is not None:
+                attention_maps.append(attention_map)
+                token_texts.append(state.current_tokens[token_idx])
+        
+        if not attention_maps:
+            print("ERROR: No attention maps generated for the token range")
+            return None
+        
+        print(f"Successfully generated {len(attention_maps)} attention maps")
+        
+        # Aggregate attention maps
+        aggregated_map = np.mean(attention_maps, axis=0)
+        
+        # Create visualization
+        visualizer = AttentionVisualizer(colormap=colormap, alpha=alpha)
+        
+        token_range_text = f"Tokens {token_start_idx}-{token_end_idx}: '{' '.join(token_texts)}'"
+        
+        if show_comparison:
+            result = visualizer.create_side_by_side_comparison(
+                state.current_image,
+                aggregated_map,
+                titles=("Original Image", f"Attention: {token_range_text}")
+            )
+        else:
+            result = visualizer.create_heatmap_overlay(
+                state.current_image,
+                aggregated_map
+            )
+        
+        print("Visualization created successfully!")
+        return result
+        
+    except Exception as e:
+        print(f"Error in visualization: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
 
 def visualize_token_attention(
     token_selector: str,
@@ -467,6 +618,216 @@ def visualize_token_attention(
 
 
 # =============================================================================
+# Token Selection HTML Generator
+# =============================================================================
+
+def generate_token_display_html(tokens, start_idx=None, end_idx=None):
+    """
+    Generate static HTML displaying tokens with highlighting.
+    
+    Args:
+        tokens: List of token strings
+        start_idx: Start index of selection (None if not selected)
+        end_idx: End index of selection (None if not selected)
+        
+    Returns:
+        HTML string with token display
+    """
+    if not tokens:
+        return "<p style='color: gray;'>No tokens to display</p>"
+    
+    html = """
+    <style>
+        .token-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            max-height: 400px;
+            overflow-y: auto;
+            border: 2px solid #dee2e6;
+        }
+        .token-box {
+            padding: 8px 14px;
+            border: 2px solid #dee2e6;
+            border-radius: 6px;
+            background-color: white;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            display: inline-block;
+        }
+        .token-box.start {
+            background-color: #0066cc;
+            color: white;
+            border-color: #0052a3;
+            font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,102,204,0.3);
+        }
+        .token-box.end {
+            background-color: #0066cc;
+            color: white;
+            border-color: #0052a3;
+            font-weight: bold;
+            box-shadow: 0 2px 8px rgba(0,102,204,0.3);
+        }
+        .token-box.in-range {
+            background-color: #cce5ff;
+            color: #003d7a;
+            border-color: #99ccff;
+            font-weight: 500;
+        }
+        .token-index {
+            font-size: 10px;
+            color: #6c757d;
+            margin-right: 6px;
+            font-weight: normal;
+        }
+        .token-box.start .token-index,
+        .token-box.end .token-index {
+            color: #ffffff;
+        }
+        .token-box.in-range .token-index {
+            color: #0052a3;
+        }
+    </style>
+    
+    <div class="token-container">
+    """
+    
+    for i, token in enumerate(tokens):
+        # Escape HTML special characters
+        token_escaped = token.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+        
+        # Determine class based on selection
+        token_class = "token-box"
+        if start_idx is not None and end_idx is not None:
+            if i == start_idx:
+                token_class += " start"
+            elif i == end_idx:
+                token_class += " end"
+            elif start_idx < i < end_idx:
+                token_class += " in-range"
+        
+        html += f"""
+        <div class="{token_class}">
+            <span class="token-index">[{i}]</span>
+            <span class="token-text">{token_escaped}</span>
+        </div>
+        """
+    
+    html += """
+    </div>
+    """
+    
+    return html
+
+
+# =============================================================================
+# Unified Visualization Interface
+# =============================================================================
+
+def update_token_range_display_manual(start_idx: int, end_idx: int) -> str:
+    """
+    Update the HTML display when manual input changes.
+    
+    Args:
+        start_idx: Start token index
+        end_idx: End token index
+        
+    Returns:
+        Updated HTML string
+    """
+    if state.current_tokens is None or len(state.current_tokens) == 0:
+        return "<p style='color: gray;'>No tokens available</p>"
+    
+    try:
+        # Validate indices
+        start_idx = max(0, min(int(start_idx), len(state.current_tokens) - 1))
+        end_idx = max(0, min(int(end_idx), len(state.current_tokens) - 1))
+        
+        # Ensure start <= end
+        if start_idx > end_idx:
+            start_idx, end_idx = end_idx, start_idx
+        
+        return generate_token_display_html(state.current_tokens, start_idx, end_idx)
+    except Exception as e:
+        print(f"Error updating token display: {e}")
+        return generate_token_display_html(state.current_tokens, 0, 0)
+
+
+def visualize_attention_unified(
+    selection_mode: str,
+    token_selector: Optional[str],
+    token_range_start_idx: int,
+    token_range_end_idx: int,
+    layer_start: int,
+    layer_end: int,
+    head_start: int,
+    head_end: int,
+    aggregation_method: str,
+    colormap: str,
+    alpha: float,
+    show_comparison: bool
+) -> Optional[Image.Image]:
+    """
+    Unified visualization function that handles both single token and token range.
+    
+    Args:
+        selection_mode: "Single Token" or "Token Range"
+        token_selector: Selected token string (for single token mode)
+        token_range_start_idx: Start token index (for range mode)
+        token_range_end_idx: End token index (for range mode)
+        ... other parameters
+        
+    Returns:
+        PIL Image with visualization
+    """
+    if selection_mode == "Single Token":
+        # Use single token visualization
+        return visualize_token_attention(
+            token_selector=token_selector,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            head_start=head_start,
+            head_end=head_end,
+            aggregation_method=aggregation_method,
+            colormap=colormap,
+            alpha=alpha,
+            show_comparison=show_comparison
+        )
+    else:
+        # Use token range visualization with provided indices
+        try:
+            token_start_idx = int(token_range_start_idx)
+            token_end_idx = int(token_range_end_idx)
+            
+            if token_start_idx > token_end_idx:
+                print("WARNING: Start token is after end token, swapping them")
+                token_start_idx, token_end_idx = token_end_idx, token_start_idx
+            
+            # Use token range visualization
+            return visualize_token_range_attention(
+                token_start_idx=token_start_idx,
+                token_end_idx=token_end_idx,
+                layer_start=layer_start,
+                layer_end=layer_end,
+                head_start=head_start,
+                head_end=head_end,
+                aggregation_method=aggregation_method,
+                colormap=colormap,
+                alpha=alpha,
+                show_comparison=show_comparison
+            )
+        except Exception as e:
+            print(f"ERROR: Failed to visualize token range: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+
+# =============================================================================
 # Gradio Interface
 # =============================================================================
 
@@ -523,11 +884,49 @@ def create_interface():
 
         with gr.Row():
             with gr.Column(scale=1):
+                # Selection mode
+                selection_mode = gr.Radio(
+                    ["Single Token", "Token Range"],
+                    value="Single Token",
+                    label="Selection Mode",
+                    info="Choose to visualize a single token or aggregate attention over multiple tokens"
+                )
+                
+                # Single token selector
                 token_selector = gr.Dropdown(
                     label="Select Token",
                     choices=[],
-                    interactive=True
+                    interactive=True,
+                    visible=True
                 )
+                
+                # Token range selector
+                with gr.Column(visible=False) as token_range_col:
+                    # Token visualization display
+                    token_range_display = gr.HTML(
+                        value="<p style='color: gray;'>Generate text first to see tokens</p>"
+                    )
+                    
+                    # Range input fields
+                    with gr.Row():
+                        token_range_start_input = gr.Number(
+                            label="Start Index",
+                            value=0,
+                            precision=0,
+                            minimum=0,
+                            interactive=True
+                        )
+                        token_range_end_input = gr.Number(
+                            label="End Index",
+                            value=0,
+                            precision=0,
+                            minimum=0,
+                            interactive=True
+                        )
+                        update_display_btn = gr.Button(
+                            "Update", 
+                            size="sm"
+                        )
 
                 with gr.Accordion("Attention Settings", open=True):
                     with gr.Row():
@@ -580,16 +979,11 @@ def create_interface():
         ---
         ### 📖 How to Use
 
-        1. **Load Model**: Click "Load Model" to initialize Qwen2.5-VL
-        2. **Generate**: Upload an image and prompt, then click "Generate"
-        3. **Explore**: Select any generated token and click "Visualize" to see attention heatmap
-        4. **Customize**: Adjust layer/head ranges and visualization settings to explore different patterns
-
-        ### 💡 Tips
-
-        - **Layers**: Later layers (60-80) often show more semantic attention
-        - **Heads**: Different heads may focus on different aspects
-        - **Aggregation**: "Mean" gives overall pattern, "Max" highlights peaks
+        1. **Load Model**: Click "Load Model"
+        2. **Generate**: Upload image and click "Generate"  
+        3. **Visualize**: 
+           - **Single Token**: Select a token from dropdown
+           - **Token Range**: Enter start/end indices, click Update, then Visualize
         """)
 
         # Event handlers
@@ -602,15 +996,37 @@ def create_interface():
             fn=generate_with_attention,
             inputs=[image_input, prompt_input, max_tokens, temperature, top_p],
             outputs=[output_text, gen_status, token_selector, 
-                    layer_start, layer_end, head_start, head_end]
+                    layer_start, layer_end, head_start, head_end,
+                    token_range_display, token_range_start_input, token_range_end_input]
+        )
+        
+        # Toggle visibility based on selection mode
+        def toggle_selection_mode(mode):
+            if mode == "Single Token":
+                return gr.update(visible=True), gr.update(visible=False)
+            else:
+                return gr.update(visible=False), gr.update(visible=True)
+        
+        selection_mode.change(
+            fn=toggle_selection_mode,
+            inputs=[selection_mode],
+            outputs=[token_selector, token_range_col]
+        )
+        
+        # Update HTML display when update button is clicked
+        update_display_btn.click(
+            fn=update_token_range_display_manual,
+            inputs=[token_range_start_input, token_range_end_input],
+            outputs=[token_range_display]
         )
 
         visualize_btn.click(
-            fn=visualize_token_attention,
+            fn=visualize_attention_unified,
             inputs=[
-                token_selector, layer_start, layer_end,
-                head_start, head_end, aggregation,
-                colormap, alpha_slider, show_comparison
+                selection_mode, token_selector, 
+                token_range_start_input, token_range_end_input,
+                layer_start, layer_end, head_start, head_end, 
+                aggregation, colormap, alpha_slider, show_comparison
             ],
             outputs=output_viz
         )
