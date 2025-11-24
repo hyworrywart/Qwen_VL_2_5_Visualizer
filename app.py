@@ -121,14 +121,14 @@ def generate_with_attention(
     empty_html = "<p style='color: gray;'>No tokens to display</p>"
     
     if state.model is None:
-        return ("", "Please load the model first!", gr.update(choices=[], value=None),
+        return ("", "Please load the model first!",
                 gr.update(), gr.update(), gr.update(), gr.update(), 
-                empty_html, 0, 0)
+                empty_html, gr.update(), gr.update(), gr.update())
 
     if image is None:
-        return ("", "Please upload an image!", gr.update(choices=[], value=None),
+        return ("", "Please upload an image!",
                 gr.update(), gr.update(), gr.update(), gr.update(), 
-                empty_html, 0, 0)
+                empty_html, gr.update(), gr.update(), gr.update())
 
     try:
         # Reset previous state
@@ -254,19 +254,7 @@ def generate_with_attention(
             info = state.current_processor.get_sequence_info()
             print(f"Sequence info: {info}")
 
-        # Create token choices for dropdown
-        token_choices = [
-            f"Token {i}: '{tok}'"
-            for i, tok in enumerate(state.current_tokens)
-        ]
-
         status = f"✓ Generated {len(generated_ids)} tokens successfully!"
-
-        # Return dropdown update with choices and select first token by default
-        dropdown_update = gr.update(
-            choices=token_choices,
-            value=token_choices[0] if token_choices else None
-        )
         
         # Get actual layer and head counts for UI updates
         # Use the first generation step to get layer/head info
@@ -294,16 +282,24 @@ def generate_with_attention(
         initial_end = min(4, num_tokens - 1)
         
         # Generate initial HTML display
-        initial_html = generate_token_display_html(
+        display_html = generate_token_range_display_html(
             state.current_tokens,
             start_idx=initial_start,
-            end_idx=initial_end
+            end_idx=initial_end,
+            click_count=2
         )
+        
+        # Update slider configs
+        slider_max = num_tokens - 1
+        token_index_update = gr.update(maximum=slider_max, value=0)
+        start_slider_update = gr.update(maximum=slider_max, value=initial_start)
+        end_slider_update = gr.update(maximum=slider_max, value=initial_end)
 
-        return (generated_text, status, dropdown_update, 
+        return (generated_text, status, 
                 layer_start_update, layer_end_update,
                 head_start_update, head_end_update,
-                initial_html, initial_start, initial_end)
+                display_html,
+                token_index_update, start_slider_update, end_slider_update)
 
     except Exception as e:
         error_msg = f"Error during generation: {str(e)}"
@@ -311,9 +307,9 @@ def generate_with_attention(
         import traceback
         traceback.print_exc()
         error_html = "<p style='color: red;'>Error during generation</p>"
-        return ("", f"✗ {error_msg}", gr.update(choices=[], value=None),
+        return ("", f"✗ {error_msg}",
                 gr.update(), gr.update(), gr.update(), gr.update(), 
-                error_html, 0, 0)
+                error_html, gr.update(), gr.update(), gr.update())
 
 
 # =============================================================================
@@ -621,14 +617,13 @@ def visualize_token_attention(
 # Token Selection HTML Generator
 # =============================================================================
 
-def generate_token_display_html(tokens, start_idx=None, end_idx=None):
+def generate_single_token_display_html(tokens, selected_idx=None):
     """
-    Generate static HTML displaying tokens with highlighting.
+    Generate interactive HTML for Single Token mode.
     
     Args:
         tokens: List of token strings
-        start_idx: Start index of selection (None if not selected)
-        end_idx: End index of selection (None if not selected)
+        selected_idx: Currently selected token index
         
     Returns:
         HTML string with token display
@@ -636,9 +631,11 @@ def generate_token_display_html(tokens, start_idx=None, end_idx=None):
     if not tokens:
         return "<p style='color: gray;'>No tokens to display</p>"
     
-    html = """
+    # Generate token selector buttons as HTML
+    html_parts = []
+    html_parts.append("""
     <style>
-        .token-container {
+        .token-grid {
             display: flex;
             flex-wrap: wrap;
             gap: 8px;
@@ -647,119 +644,285 @@ def generate_token_display_html(tokens, start_idx=None, end_idx=None):
             border-radius: 8px;
             max-height: 400px;
             overflow-y: auto;
-            border: 2px solid #dee2e6;
         }
-        .token-box {
+        .token-btn {
             padding: 8px 14px;
             border: 2px solid #dee2e6;
             border-radius: 6px;
             background-color: white;
             font-family: 'Courier New', monospace;
             font-size: 13px;
-            display: inline-block;
+            cursor: pointer;
+            transition: all 0.2s ease;
         }
-        .token-box.start {
-            background-color: #0066cc;
+        .token-btn:hover {
+            background-color: #e7f3ff;
+            border-color: #0066cc;
+            transform: translateY(-2px);
+        }
+        .token-btn.selected {
+            background-color: #28a745;
             color: white;
-            border-color: #0052a3;
+            border-color: #218838;
             font-weight: bold;
-            box-shadow: 0 2px 8px rgba(0,102,204,0.3);
         }
-        .token-box.end {
-            background-color: #0066cc;
-            color: white;
-            border-color: #0052a3;
-            font-weight: bold;
-            box-shadow: 0 2px 8px rgba(0,102,204,0.3);
-        }
-        .token-box.in-range {
-            background-color: #cce5ff;
-            color: #003d7a;
-            border-color: #99ccff;
-            font-weight: 500;
-        }
-        .token-index {
+        .token-idx {
             font-size: 10px;
             color: #6c757d;
             margin-right: 6px;
-            font-weight: normal;
         }
-        .token-box.start .token-index,
-        .token-box.end .token-index {
+        .token-btn.selected .token-idx {
             color: #ffffff;
         }
-        .token-box.in-range .token-index {
+    </style>
+    """)
+    
+    if selected_idx is None:
+        html_parts.append('<p style="margin-bottom: 10px; color: #155724;">💡 Select a token from dropdown or use manual input</p>')
+    else:
+        html_parts.append(f'<p style="margin-bottom: 10px; color: #155724;">✓ Token [{selected_idx}] selected</p>')
+    
+    html_parts.append('<div class="token-grid">')
+    for i, token in enumerate(tokens):
+        token_escaped = token.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        css_class = "token-btn selected" if i == selected_idx else "token-btn"
+        html_parts.append(f'<div class="{css_class}"><span class="token-idx">[{i}]</span>{token_escaped}</div>')
+    html_parts.append('</div>')
+    
+    return ''.join(html_parts)
+
+
+def generate_token_range_display_html(tokens, start_idx=None, end_idx=None, click_count=0):
+    """
+    Generate interactive HTML for Token Range mode.
+    
+    Args:
+        tokens: List of token strings
+        start_idx: Start index of selection (None if not selected)
+        end_idx: End index of selection (None if not selected)
+        click_count: Number of clicks made (0, 1, or 2+)
+        
+    Returns:
+        HTML string with token display
+    """
+    if not tokens:
+        return "<p style='color: gray;'>No tokens to display</p>"
+    
+    html_parts = []
+    html_parts.append("""
+    <style>
+        .token-grid-range {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border-radius: 8px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .token-btn-range {
+            padding: 8px 14px;
+            border: 2px solid #dee2e6;
+            border-radius: 6px;
+            background-color: white;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            transition: all 0.2s ease;
+        }
+        .token-btn-range.start,
+        .token-btn-range.end {
+            background-color: #0066cc;
+            color: white;
+            border-color: #0052a3;
+            font-weight: bold;
+        }
+        .token-btn-range.in-range {
+            background-color: #cce5ff;
+            color: #003d7a;
+            border-color: #99ccff;
+        }
+        .token-idx-range {
+            font-size: 10px;
+            color: #6c757d;
+            margin-right: 6px;
+        }
+        .token-btn-range.start .token-idx-range,
+        .token-btn-range.end .token-idx-range {
+            color: #ffffff;
+        }
+        .token-btn-range.in-range .token-idx-range {
             color: #0052a3;
         }
     </style>
+    """)
     
-    <div class="token-container">
-    """
+    # Add hint message
+    if click_count == 0:
+        html_parts.append('<p style="margin-bottom: 10px; padding: 10px; background-color: #e7f3ff; border-left: 4px solid #0066cc; border-radius: 4px;">💡 Use manual input below to set <strong>Start Index</strong></p>')
+    elif click_count == 1:
+        html_parts.append('<p style="margin-bottom: 10px; padding: 10px; background-color: #e7f3ff; border-left: 4px solid #0066cc; border-radius: 4px;">💡 Now set <strong>End Index</strong></p>')
+    else:
+        html_parts.append('<p style="margin-bottom: 10px; padding: 10px; background-color: #e7f3ff; border-left: 4px solid #0066cc; border-radius: 4px;">✓ Range selected. You can adjust values below.</p>')
+    
+    html_parts.append('<div class="token-grid-range">')
     
     for i, token in enumerate(tokens):
-        # Escape HTML special characters
-        token_escaped = token.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;').replace("'", '&#39;')
+        token_escaped = token.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         
-        # Determine class based on selection
-        token_class = "token-box"
+        css_class = "token-btn-range"
         if start_idx is not None and end_idx is not None:
             if i == start_idx:
-                token_class += " start"
+                css_class += " start"
             elif i == end_idx:
-                token_class += " end"
-            elif start_idx < i < end_idx:
-                token_class += " in-range"
+                css_class += " end"
+            elif min(start_idx, end_idx) < i < max(start_idx, end_idx):
+                css_class += " in-range"
+        elif start_idx is not None and click_count == 1:
+            if i == start_idx:
+                css_class += " start"
         
-        html += f"""
-        <div class="{token_class}">
-            <span class="token-index">[{i}]</span>
-            <span class="token-text">{token_escaped}</span>
-        </div>
-        """
+        html_parts.append(f'<div class="{css_class}"><span class="token-idx-range">[{i}]</span>{token_escaped}</div>')
     
-    html += """
-    </div>
-    """
+    html_parts.append('</div>')
     
-    return html
+    return ''.join(html_parts)
 
 
 # =============================================================================
 # Unified Visualization Interface
 # =============================================================================
 
-def update_token_range_display_manual(start_idx: int, end_idx: int) -> str:
+def handle_single_token_click(token_idx):
+    """Handle clicking a token in Single Token mode."""
+    if state.current_tokens is None or len(state.current_tokens) == 0:
+        return gr.update(), "<p style='color: gray;'>No tokens available</p>"
+    
+    # Update dropdown selection
+    token_choices = [f"Token {i}: '{tok}'" for i, tok in enumerate(state.current_tokens)]
+    if 0 <= token_idx < len(token_choices):
+        dropdown_value = token_choices[token_idx]
+        html = generate_single_token_display_html(state.current_tokens, token_idx)
+        return gr.update(value=dropdown_value), html
+    return gr.update(), generate_single_token_display_html(state.current_tokens, None)
+
+
+def handle_range_token_click(token_idx, current_start, current_end, click_count):
+    """Handle clicking a token in Token Range mode."""
+    if state.current_tokens is None or len(state.current_tokens) == 0:
+        return None, None, 0, "<p style='color: gray;'>No tokens available</p>"
+    
+    try:
+        # Validate token index
+        if token_idx < 0 or token_idx >= len(state.current_tokens):
+            return current_start, current_end, click_count, generate_token_range_display_html(
+                state.current_tokens, current_start, current_end, click_count
+            )
+        
+        # Determine what to do based on click count
+        if click_count == 0 or click_count >= 2:
+            # First click or reset - set start
+            new_start = token_idx
+            new_end = None
+            new_click_count = 1
+        elif click_count == 1:
+            # Second click - set end
+            new_start = current_start
+            new_end = token_idx
+            new_click_count = 2
+        else:
+            new_start = current_start
+            new_end = current_end
+            new_click_count = click_count
+        
+        # Generate updated HTML
+        html = generate_token_range_display_html(
+            state.current_tokens, 
+            new_start, 
+            new_end, 
+            new_click_count
+        )
+        
+        return new_start, new_end, new_click_count, html
+        
+    except Exception as e:
+        print(f"Error handling range token click: {e}")
+        import traceback
+        traceback.print_exc()
+        return current_start, current_end, click_count, generate_token_range_display_html(
+            state.current_tokens, current_start, current_end, click_count
+        )
+
+
+def update_token_range_display_manual(start_idx, end_idx, click_state):
     """
     Update the HTML display when manual input changes.
     
     Args:
-        start_idx: Start token index
-        end_idx: End token index
+        start_idx: Start token index (can be None)
+        end_idx: End token index (can be None)
+        click_state: Current click count state
         
     Returns:
-        Updated HTML string
+        Updated HTML string and updated click state
     """
+    if state.current_tokens is None or len(state.current_tokens) == 0:
+        return "<p style='color: gray;'>No tokens available</p>", 0
+    
+    try:
+        # Handle None values
+        if start_idx is None or start_idx == '':
+            start_idx = None
+            click_count = 0
+        else:
+            start_idx = max(0, min(int(start_idx), len(state.current_tokens) - 1))
+            click_count = 1 if (end_idx is None or end_idx == '') else 2
+        
+        if end_idx is None or end_idx == '':
+            end_idx = None
+        else:
+            end_idx = max(0, min(int(end_idx), len(state.current_tokens) - 1))
+            click_count = 2
+        
+        # If both are set, use click_state to determine if we should show full selection
+        if start_idx is not None and end_idx is not None:
+            click_count = click_state if click_state > 0 else 2
+        
+        html = generate_token_range_display_html(
+            state.current_tokens, 
+            start_idx, 
+            end_idx, 
+            click_count
+        )
+        
+        return html, click_count
+        
+    except Exception as e:
+        print(f"Error updating token display: {e}")
+        import traceback
+        traceback.print_exc()
+        return generate_token_range_display_html(state.current_tokens, None, None, 0), 0
+
+
+def update_single_token_display(token_selector):
+    """Update Single Token display based on dropdown selection."""
     if state.current_tokens is None or len(state.current_tokens) == 0:
         return "<p style='color: gray;'>No tokens available</p>"
     
+    if token_selector is None or token_selector == "":
+        return generate_single_token_display_html(state.current_tokens, None)
+    
     try:
-        # Validate indices
-        start_idx = max(0, min(int(start_idx), len(state.current_tokens) - 1))
-        end_idx = max(0, min(int(end_idx), len(state.current_tokens) - 1))
-        
-        # Ensure start <= end
-        if start_idx > end_idx:
-            start_idx, end_idx = end_idx, start_idx
-        
-        return generate_token_display_html(state.current_tokens, start_idx, end_idx)
-    except Exception as e:
-        print(f"Error updating token display: {e}")
-        return generate_token_display_html(state.current_tokens, 0, 0)
+        # Extract token index from selector string
+        token_idx = int(token_selector.split(":")[0].split()[-1])
+        return generate_single_token_display_html(state.current_tokens, token_idx)
+    except:
+        return generate_single_token_display_html(state.current_tokens, None)
 
 
 def visualize_attention_unified(
     selection_mode: str,
-    token_selector: Optional[str],
+    token_index: int,
     token_range_start_idx: int,
     token_range_end_idx: int,
     layer_start: int,
@@ -776,7 +939,7 @@ def visualize_attention_unified(
     
     Args:
         selection_mode: "Single Token" or "Token Range"
-        token_selector: Selected token string (for single token mode)
+        token_index: Token index (for single token mode)
         token_range_start_idx: Start token index (for range mode)
         token_range_end_idx: End token index (for range mode)
         ... other parameters
@@ -785,7 +948,16 @@ def visualize_attention_unified(
         PIL Image with visualization
     """
     if selection_mode == "Single Token":
-        # Use single token visualization
+        # Use single token visualization with index
+        if state.current_tokens is None or len(state.current_tokens) == 0:
+            print("ERROR: No tokens available")
+            return None
+        
+        # Create fake token_selector string for compatibility with existing function
+        token_idx = int(token_index) if token_index is not None else 0
+        token_idx = max(0, min(token_idx, len(state.current_tokens) - 1))
+        token_selector = f"Token {token_idx}: '{state.current_tokens[token_idx]}'"
+        
         return visualize_token_attention(
             token_selector=token_selector,
             layer_start=layer_start,
@@ -800,6 +972,16 @@ def visualize_attention_unified(
     else:
         # Use token range visualization with provided indices
         try:
+            # Check if indices are valid (not None)
+            if token_range_start_idx is None or token_range_end_idx is None:
+                print("ERROR: Please select both start and end indices by clicking on tokens")
+                return None
+            
+            # Handle empty string values
+            if token_range_start_idx == '' or token_range_end_idx == '':
+                print("ERROR: Please select both start and end indices by clicking on tokens")
+                return None
+            
             token_start_idx = int(token_range_start_idx)
             token_end_idx = int(token_range_end_idx)
             
@@ -887,46 +1069,45 @@ def create_interface():
                 # Selection mode
                 selection_mode = gr.Radio(
                     ["Single Token", "Token Range"],
-                    value="Single Token",
+                    value="Token Range",
                     label="Selection Mode",
                     info="Choose to visualize a single token or aggregate attention over multiple tokens"
                 )
                 
-                # Single token selector
-                token_selector = gr.Dropdown(
-                    label="Select Token",
-                    choices=[],
+                # Single token selector (simple slider)
+                token_index = gr.Slider(
+                    minimum=0,
+                    maximum=10,
+                    value=0,
+                    step=1,
+                    label="Token Index",
                     interactive=True,
-                    visible=True
+                    visible=False
                 )
                 
-                # Token range selector
-                with gr.Column(visible=False) as token_range_col:
-                    # Token visualization display
-                    token_range_display = gr.HTML(
-                        value="<p style='color: gray;'>Generate text first to see tokens</p>"
+                # Token range selectors (two sliders)
+                with gr.Row(visible=True) as token_range_row:
+                    token_range_start = gr.Slider(
+                        minimum=0,
+                        maximum=10,
+                        value=0,
+                        step=1,
+                        label="Start Index",
+                        interactive=True
                     )
-                    
-                    # Range input fields
-                    with gr.Row():
-                        token_range_start_input = gr.Number(
-                            label="Start Index",
-                            value=0,
-                            precision=0,
-                            minimum=0,
-                            interactive=True
-                        )
-                        token_range_end_input = gr.Number(
-                            label="End Index",
-                            value=0,
-                            precision=0,
-                            minimum=0,
-                            interactive=True
-                        )
-                        update_display_btn = gr.Button(
-                            "Update", 
-                            size="sm"
-                        )
+                    token_range_end = gr.Slider(
+                        minimum=0,
+                        maximum=10,
+                        value=4,
+                        step=1,
+                        label="End Index",
+                        interactive=True
+                    )
+                
+                # Token display (for both modes)
+                token_display = gr.HTML(
+                    value="<p style='color: gray;'>Generate text first to see tokens</p>"
+                )
 
                 with gr.Accordion("Attention Settings", open=True):
                     with gr.Row():
@@ -982,8 +1163,8 @@ def create_interface():
         1. **Load Model**: Click "Load Model"
         2. **Generate**: Upload image and click "Generate"  
         3. **Visualize**: 
-           - **Single Token**: Select a token from dropdown
-           - **Token Range**: Enter start/end indices, click Update, then Visualize
+           - **Single Token**: Use slider to select token index
+           - **Token Range**: Use two sliders to set start/end indices
         """)
 
         # Event handlers
@@ -995,9 +1176,10 @@ def create_interface():
         generate_btn.click(
             fn=generate_with_attention,
             inputs=[image_input, prompt_input, max_tokens, temperature, top_p],
-            outputs=[output_text, gen_status, token_selector, 
+            outputs=[output_text, gen_status,
                     layer_start, layer_end, head_start, head_end,
-                    token_range_display, token_range_start_input, token_range_end_input]
+                    token_display,
+                    token_index, token_range_start, token_range_end]
         )
         
         # Toggle visibility based on selection mode
@@ -1010,21 +1192,47 @@ def create_interface():
         selection_mode.change(
             fn=toggle_selection_mode,
             inputs=[selection_mode],
-            outputs=[token_selector, token_range_col]
+            outputs=[token_index, token_range_row]
         )
         
-        # Update HTML display when update button is clicked
-        update_display_btn.click(
-            fn=update_token_range_display_manual,
-            inputs=[token_range_start_input, token_range_end_input],
-            outputs=[token_range_display]
+        # Update display when single token index changes
+        def update_single_display(idx):
+            if state.current_tokens is None:
+                return "<p style='color: gray;'>No tokens available</p>"
+            token_idx = int(idx) if idx is not None else 0
+            return generate_single_token_display_html(state.current_tokens, token_idx)
+        
+        token_index.change(
+            fn=update_single_display,
+            inputs=[token_index],
+            outputs=[token_display]
+        )
+        
+        # Update display when range sliders change
+        def update_range_display(start, end):
+            if state.current_tokens is None:
+                return "<p style='color: gray;'>No tokens available</p>"
+            start_idx = int(start) if start is not None else 0
+            end_idx = int(end) if end is not None else 0
+            return generate_token_range_display_html(state.current_tokens, start_idx, end_idx, 2)
+        
+        token_range_start.change(
+            fn=update_range_display,
+            inputs=[token_range_start, token_range_end],
+            outputs=[token_display]
+        )
+        
+        token_range_end.change(
+            fn=update_range_display,
+            inputs=[token_range_start, token_range_end],
+            outputs=[token_display]
         )
 
         visualize_btn.click(
             fn=visualize_attention_unified,
             inputs=[
-                selection_mode, token_selector, 
-                token_range_start_input, token_range_end_input,
+                selection_mode, token_index, 
+                token_range_start, token_range_end,
                 layer_start, layer_end, head_start, head_end, 
                 aggregation, colormap, alpha_slider, show_comparison
             ],
