@@ -75,3 +75,7 @@ flagged/
 tmp/
 temp/
 *.tmp
+
+
+# local inference
+inference.py

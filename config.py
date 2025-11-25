@@ -3,6 +3,7 @@ Configuration file for Qwen2.5-VL Attention Visualization Tool
 """
 
 import os
+import torch
 from pathlib import Path
 
 # =============================================================================
@@ -15,7 +16,7 @@ PROCESSOR_NAME = "/data/yuwei_hu/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/
 
 # Model loading parameters
 MODEL_DEVICE_MAP = "auto"  # Auto-assign layers to available devices
-MODEL_TORCH_DTYPE = "auto"  # Auto-select dtype based on hardware
+MODEL_TORCH_DTYPE = torch.float32  # Use float32 for full precision
 
 # Special token IDs (from Qwen2.5-VL config)
 IMAGE_TOKEN_ID = 151655
@@ -44,7 +45,7 @@ SPECIFIC_LAYERS = [20, 21, 22, 23, 24]  # Last 5 layers (if EXTRACT_ALL_LAYERS=F
 
 # Attention storage
 STORE_ON_CPU = True  # Offload attention to CPU to save GPU memory
-USE_FLOAT16 = True  # Use float16 for attention storage (saves memory)
+USE_FLOAT16 = False  # Use float32 for attention storage (full precision)
 
 # =============================================================================
 # Visualization Configuration
@@ -68,14 +69,14 @@ FIGURE_SIZE = (10, 8)
 
 # Server settings
 GRADIO_SERVER_NAME = "127.0.0.1"  # Local only
-GRADIO_SERVER_PORT = 7860
+GRADIO_SERVER_PORT = 7861
 GRADIO_SHARE = False  # Don't create public link
 
 # Interface settings
 MAX_IMAGE_SIZE = 1024  # Maximum dimension for uploaded images
 DEFAULT_MAX_NEW_TOKENS = 128
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.9
+DEFAULT_TEMPERATURE = 0
+DEFAULT_TOP_P = 0.7
 
 # Example prompts
 EXAMPLE_PROMPTS = [
