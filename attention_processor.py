@@ -380,6 +380,89 @@ class AttentionProcessor:
 
         return positions
 
+    def get_attention_distribution(
+        self,
+        attention_weights: Dict[int, Dict[int, torch.Tensor]],
+        token_position: int,
+        input_length: int,
+        layer_indices: Optional[List[int]] = None,
+        head_indices: Optional[List[int]] = None,
+        aggregation_method: str = "mean"
+    ) -> Optional[Dict[str, float]]:
+        """
+        Calculate attention distribution between image and prompt text tokens.
+        
+        This is a statistical measure that should remain consistent regardless of
+        visualization preferences. Typically called with aggregation_method="mean"
+        to ensure objective, reproducible results.
+        
+        Args:
+            attention_weights: Attention weights {layer_idx: {head_idx: tensor}}
+            token_position: Position of token to analyze
+            input_length: Length of input sequence (prompt + image tokens, excluding generated tokens)
+            layer_indices: Layers to aggregate
+            head_indices: Heads to aggregate
+            aggregation_method: How to aggregate (typically "mean" for consistent statistics)
+            
+        Returns:
+            Dictionary with 'image_percentage' and 'prompt_text_percentage'
+        """
+        # Aggregate attention across layers and heads using utils
+        aggregated_attn = utils.aggregate_attention(
+            attention_weights,
+            layer_indices=layer_indices,
+            head_indices=head_indices,
+            aggregation_method=aggregation_method
+        )
+        
+        if aggregated_attn is None:
+            return None
+        
+        # Extract attention from the specified token to all positions
+        if aggregated_attn.dim() == 2:
+            if aggregated_attn.size(0) == 1:
+                attention_from_token = aggregated_attn[0, :]
+            elif token_position < aggregated_attn.size(0):
+                attention_from_token = aggregated_attn[token_position, :]
+            else:
+                return None
+        else:
+            return None
+        
+        # Calculate total attention to vision tokens (image)
+        vision_attention_sum = 0.0
+        vision_token_positions = set()
+        for start, end in self.vision_token_ranges['image']:
+            vision_attention_sum += attention_from_token[start:end].sum().item()
+            vision_token_positions.update(range(start, end))
+        for start, end in self.vision_token_ranges['video']:
+            vision_attention_sum += attention_from_token[start:end].sum().item()
+            vision_token_positions.update(range(start, end))
+        
+        # Calculate attention to prompt text tokens (input tokens that are not vision tokens)
+        # Only consider tokens within input_length (exclude generated tokens)
+        prompt_text_attention_sum = 0.0
+        for pos in range(min(input_length, len(attention_from_token))):
+            if pos not in vision_token_positions:
+                prompt_text_attention_sum += attention_from_token[pos].item()
+        
+        # Calculate total attention within input range
+        total_attention_in_input = vision_attention_sum + prompt_text_attention_sum
+        
+        # Calculate percentages
+        if total_attention_in_input > 0:
+            image_percentage = (vision_attention_sum / total_attention_in_input) * 100
+            prompt_text_percentage = (prompt_text_attention_sum / total_attention_in_input) * 100
+        else:
+            image_percentage = 0.0
+            prompt_text_percentage = 0.0
+        
+        return {
+            'image_percentage': image_percentage,
+            'prompt_text_percentage': prompt_text_percentage,
+            'total_attention_in_input': total_attention_in_input
+        }
+
     def get_sequence_info(self) -> Dict[str, Any]:
         """
         Get information about the processed sequence.
