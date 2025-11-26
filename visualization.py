@@ -13,6 +13,8 @@ import cv2
 from PIL import Image
 from typing import Optional, Tuple, List, Union
 import config
+import os
+from pathlib import Path
 
 
 class AttentionVisualizer:
@@ -397,3 +399,163 @@ def create_layer_head_visualization(
         return Image.fromarray(image)
 
     return visualizer.create_multi_token_comparison(image, all_maps, all_labels)
+
+
+def create_sliding_window_attention_video(
+    image: Union[Image.Image, np.ndarray],
+    sliding_window_results: List[Tuple[List[int], np.ndarray]],
+    token_texts: Optional[List[str]] = None,
+    output_path: Optional[Union[str, Path]] = None,
+    fps: int = 2,
+    colormap: str = config.HEATMAP_COLORMAP,
+    alpha: float = config.HEATMAP_ALPHA,
+    show_token_info: bool = True,
+    video_size: Optional[Tuple[int, int]] = None
+) -> str:
+    """
+    创建滑动窗口注意力热力图的动态视频。
+    
+    Args:
+        image: 原始图像
+        sliding_window_results: 滑动窗口结果列表，每个元素为(window_positions, attention_map)
+        token_texts: token文本列表（可选）
+        output_path: 输出视频路径，如果为None则自动生成
+        fps: 视频帧率（每秒帧数）
+        colormap: 热力图颜色映射
+        alpha: 热力图透明度
+        show_token_info: 是否在视频中显示token信息
+        video_size: 视频尺寸(width, height)，如果为None则使用图像尺寸
+        
+    Returns:
+        输出视频文件路径
+    """
+    print(f"\n[create_sliding_window_attention_video] Creating video with {len(sliding_window_results)} frames")
+    
+    if len(sliding_window_results) == 0:
+        raise ValueError("No sliding window results to create video")
+    
+    # 转换图像为numpy数组
+    if isinstance(image, Image.Image):
+        img_array = np.array(image)
+    else:
+        img_array = image
+    
+    # 确保图像是RGB格式
+    if img_array.ndim == 2:
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_GRAY2RGB)
+    elif img_array.shape[-1] == 4:
+        img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2RGB)
+    
+    # 创建可视化器
+    visualizer = AttentionVisualizer(colormap=colormap, alpha=alpha)
+    
+    # 确定视频尺寸
+    if video_size is None:
+        if show_token_info:
+            # 为token信息预留空间（在图像上方）
+            video_width = img_array.shape[1]
+            video_height = img_array.shape[0] + 100  # 额外100像素用于文本
+        else:
+            video_width = img_array.shape[1]
+            video_height = img_array.shape[0]
+    else:
+        video_width, video_height = video_size
+    
+    # 设置输出路径
+    if output_path is None:
+        output_path = config.OUTPUT_DIR / f"sliding_window_attention_{config.OUTPUT_DIR.name}.mp4"
+        # 确保文件名唯一
+        counter = 1
+        while output_path.exists():
+            output_path = config.OUTPUT_DIR / f"sliding_window_attention_{counter}.mp4"
+            counter += 1
+    else:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    print(f"[create_sliding_window_attention_video] Output path: {output_path}")
+    print(f"[create_sliding_window_attention_video] Video size: {video_width}x{video_height}")
+    print(f"[create_sliding_window_attention_video] FPS: {fps}")
+    
+    # 创建视频写入器
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video_writer = cv2.VideoWriter(
+        str(output_path),
+        fourcc,
+        fps,
+        (video_width, video_height)
+    )
+    
+    if not video_writer.isOpened():
+        raise RuntimeError(f"Failed to create video writer at {output_path}")
+    
+    # 为每个窗口创建一帧
+    for frame_idx, (window_positions, attention_map) in enumerate(sliding_window_results):
+        print(f"[create_sliding_window_attention_video] Processing frame {frame_idx + 1}/{len(sliding_window_results)}")
+        
+        # 创建热力图叠加
+        overlay = visualizer.create_heatmap_overlay(
+            img_array,
+            attention_map,
+            resize_to_image=True,
+            return_pil=False
+        )
+        
+        # 如果需要显示token信息，添加文本
+        if show_token_info:
+            # 创建带文本区域的画布
+            canvas = np.ones((video_height, video_width, 3), dtype=np.uint8) * 255
+            
+            # 将overlay放置在画布下方
+            y_offset = 100
+            canvas[y_offset:y_offset+overlay.shape[0], :overlay.shape[1]] = overlay
+            
+            # 添加窗口信息文本
+            window_text = f"Window {frame_idx + 1}/{len(sliding_window_results)}"
+            positions_text = f"Token positions: {window_positions}"
+            
+            # 如果有token文本，也显示
+            if token_texts:
+                tokens_in_window = []
+                for pos in window_positions:
+                    if pos < len(token_texts):
+                        tokens_in_window.append(token_texts[pos])
+                tokens_text = f"Tokens: {' '.join(tokens_in_window[:10])}"  # 最多显示10个token
+                if len(tokens_in_window) > 10:
+                    tokens_text += "..."
+            else:
+                tokens_text = None
+            
+            # 绘制文本
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            font_thickness = 2
+            font_color = (0, 0, 0)  # 黑色
+            
+            cv2.putText(canvas, window_text, (10, 30), font, font_scale, font_color, font_thickness)
+            cv2.putText(canvas, positions_text, (10, 60), font, font_scale * 0.8, font_color, font_thickness - 1)
+            if tokens_text:
+                cv2.putText(canvas, tokens_text, (10, 85), font, font_scale * 0.7, font_color, font_thickness - 1)
+            
+            frame = canvas
+        else:
+            frame = overlay
+        
+        # 确保帧的尺寸匹配
+        if frame.shape[0] != video_height or frame.shape[1] != video_width:
+            frame = cv2.resize(frame, (video_width, video_height))
+        
+        # BGR格式（OpenCV要求）
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        
+        # 写入帧
+        video_writer.write(frame_bgr)
+    
+    # 释放资源
+    video_writer.release()
+    
+    print(f"[create_sliding_window_attention_video] Video saved to: {output_path}")
+    print(f"[create_sliding_window_attention_video] Total frames: {len(sliding_window_results)}")
+    print(f"[create_sliding_window_attention_video] Duration: {len(sliding_window_results) / fps:.2f} seconds")
+    
+    return str(output_path)

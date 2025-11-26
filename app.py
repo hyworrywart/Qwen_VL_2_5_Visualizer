@@ -17,7 +17,7 @@ import config
 import utils
 from attention_extractor import AttentionExtractor
 from attention_processor import AttentionProcessor
-from visualization import AttentionVisualizer
+from visualization import AttentionVisualizer, create_sliding_window_attention_video
 
 # =============================================================================
 # Global Model State
@@ -38,6 +38,7 @@ class ModelState:
         self.current_input_ids = None
         self.current_image_grid_thw = None
         self.generated_text = None
+        self.generated_ids = None  # 添加：存储完整的生成序列
 
     def reset(self):
         """Reset generation-specific state."""
@@ -47,6 +48,7 @@ class ModelState:
         self.current_input_ids = None
         self.current_image_grid_thw = None
         self.generated_text = None
+        self.generated_ids = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -109,6 +111,7 @@ def load_model(model_path: str):
 def generate_with_attention(
     image: Image.Image,
     prompt: str,
+    content_order: str,
     max_new_tokens: int = config.DEFAULT_MAX_NEW_TOKENS,
     temperature: float = config.DEFAULT_TEMPERATURE,
     top_p: float = config.DEFAULT_TOP_P
@@ -135,14 +138,22 @@ def generate_with_attention(
         state.reset()
         state.current_image = image
 
-        # Prepare inputs
+        # Prepare inputs - order content based on user choice
+        if content_order == "Image → Text":
+            content_list = [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt}
+            ]
+        else:  # "Text → Image"
+            content_list = [
+                {"type": "text", "text": prompt},
+                {"type": "image", "image": image}
+            ]
+        
         messages = [
             {
                 "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt}
-                ]
+                "content": content_list
             }
         ]
 
@@ -219,6 +230,7 @@ def generate_with_attention(
         )
 
         state.generated_text = generated_text
+        state.generated_ids = output_ids[0]  # 保存完整的生成序列（包括输入）
 
         # Get individual tokens
         state.current_tokens = utils.decode_tokens_to_text(
@@ -535,6 +547,105 @@ def visualize_token_attention(
         import traceback
         traceback.print_exc()
         return None
+
+
+# =============================================================================
+# Sliding Window Video Generation
+# =============================================================================
+
+def generate_sliding_window_video(
+    window_size: int,
+    fps: int,
+    colormap: str,
+    alpha: float,
+    show_token_info: bool
+) -> Tuple[str, str]:
+    """
+    生成滑动窗口注意力视频。
+    
+    Args:
+        window_size: 滑动窗口大小
+        fps: 视频帧率
+        colormap: 颜色映射
+        alpha: 透明度
+        show_token_info: 是否显示token信息
+        
+    Returns:
+        Tuple of (video_path, status_message)
+    """
+    if state.current_attention is None or state.current_processor is None:
+        return None, "❌ 请先生成文本！"
+    
+    if state.current_image is None:
+        return None, "❌ 没有图像数据！"
+    
+    if state.current_tokens is None or len(state.current_tokens) == 0:
+        return None, "❌ 没有生成的token！"
+    
+    try:
+        # 获取生成的token位置
+        input_length = state.current_input_ids.shape[1]
+        total_length = state.generated_ids.shape[0] if state.generated_ids is not None else input_length
+        generated_token_positions = list(range(input_length, total_length))
+        
+        if len(generated_token_positions) < window_size:
+            return None, f"❌ 生成的token数量({len(generated_token_positions)})小于窗口大小({window_size})！请增加生成的token数量。"
+        
+        print(f"\n{'='*60}")
+        print(f"生成滑动窗口注意力视频")
+        print(f"{'='*60}")
+        print(f"窗口大小: {window_size}")
+        print(f"FPS: {fps}")
+        print(f"生成的token数: {len(generated_token_positions)}")
+        print(f"{'='*60}\n")
+        
+        # 计算滑动窗口注意力
+        sliding_window_results = state.current_processor.get_sliding_window_attention_maps(
+            attention_weights=state.current_attention,
+            generated_token_positions=generated_token_positions,
+            window_size=window_size,
+            layer_indices=None,  # 使用所有层
+            head_indices=None,   # 使用所有头
+            aggregation_method="mean",
+            image_idx=0,
+            normalize=True
+        )
+        
+        if not sliding_window_results:
+            return None, "❌ 无法生成滑动窗口注意力热力图！"
+        
+        # 获取token文本
+        all_token_ids = state.generated_ids.cpu().tolist() if state.generated_ids is not None else []
+        token_texts = utils.decode_tokens_to_text(all_token_ids, state.tokenizer)
+        
+        # 创建视频
+        video_path = create_sliding_window_attention_video(
+            image=state.current_image,
+            sliding_window_results=sliding_window_results,
+            token_texts=token_texts,
+            output_path=None,  # 自动生成路径
+            fps=fps,
+            colormap=colormap,
+            alpha=alpha,
+            show_token_info=show_token_info,
+            video_size=None
+        )
+        
+        success_msg = f"✅ 视频生成成功！\n"
+        success_msg += f"📁 保存路径: {video_path}\n"
+        success_msg += f"🎬 帧数: {len(sliding_window_results)}\n"
+        success_msg += f"⏱️ 时长: {len(sliding_window_results) / fps:.2f} 秒"
+        
+        print(f"\n{success_msg}\n")
+        
+        return video_path, success_msg
+        
+    except Exception as e:
+        error_msg = f"❌ 生成视频时出错: {str(e)}"
+        print(error_msg)
+        import traceback
+        traceback.print_exc()
+        return None, error_msg
 
 
 # =============================================================================
@@ -1151,6 +1262,13 @@ def create_interface():
                     value="Describe this image in detail.",
                     lines=3
                 )
+                
+                content_order = gr.Radio(
+                    ["Image → Text", "Text → Image"],
+                    value="Image → Text",
+                    label="Content Order",
+                    info="Choose whether to place the image or text first in the prompt"
+                )
 
                 with gr.Accordion("Generation Settings", open=False):
                     max_tokens = gr.Slider(16, 512, value=128, step=16, label="Max New Tokens")
@@ -1294,7 +1412,7 @@ def create_interface():
 
         generate_btn.click(
             fn=generate_with_attention,
-            inputs=[image_input, prompt_input, max_tokens, temperature, top_p],
+            inputs=[image_input, prompt_input, content_order, max_tokens, temperature, top_p],
             outputs=[output_text, gen_status,
                     token_display,
                     token_index, token_range_start, token_range_end]
@@ -1416,6 +1534,87 @@ def create_interface():
             fn=update_all_frames,
             inputs=[colormap, alpha_slider, layer_select_1, layer_select_2, layer_select_3, layer_select_4],
             outputs=[output_viz_1, output_viz_2, output_viz_3, output_viz_4]
+        )
+
+        # =====================================================================
+        # Sliding Window Video Generation Section
+        # =====================================================================
+        gr.Markdown("---")
+        gr.Markdown("### 🎬 Step 4: Generate Sliding Window Attention Video")
+        gr.Markdown("""
+        Generate a dynamic video of attention heatmaps using a sliding window over generated tokens 
+        (averaged across all layers and all attention heads).
+        """)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("#### Video Parameters")
+                
+                video_window_size = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=3,
+                    step=1,
+                    label="Window Size",
+                    info="Number of tokens per window (recommended: 3-5)"
+                )
+                
+                video_fps = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    value=2,
+                    step=1,
+                    label="FPS (Frames Per Second)",
+                    info="Video playback speed (recommended: 1-3, lower is slower)"
+                )
+                
+                video_show_token_info = gr.Checkbox(
+                    label="Show Token Information",
+                    value=True,
+                    info="Display window number, token positions and text in the video"
+                )
+                
+                with gr.Accordion("Video Visualization Settings", open=False):
+                    video_colormap = gr.Dropdown(
+                        ["jet", "hot", "viridis", "plasma", "coolwarm", "magma"],
+                        value="jet",
+                        label="Colormap"
+                    )
+                    video_alpha = gr.Slider(
+                        0.0, 1.0, value=0.5, step=0.05,
+                        label="Heatmap Transparency (Alpha)"
+                    )
+                
+                generate_video_btn = gr.Button(
+                    "🎬 Generate Video", 
+                    variant="primary", 
+                    size="lg"
+                )
+                
+                video_status = gr.Textbox(
+                    label="Status",
+                    interactive=False,
+                    lines=4
+                )
+
+            with gr.Column(scale=2):
+                gr.Markdown("#### Video Preview")
+                video_output = gr.Video(
+                    label="Generated Video",
+                    height=600
+                )
+
+        # Event handler for video generation
+        generate_video_btn.click(
+            fn=generate_sliding_window_video,
+            inputs=[
+                video_window_size,
+                video_fps,
+                video_colormap,
+                video_alpha,
+                video_show_token_info
+            ],
+            outputs=[video_output, video_status]
         )
 
     return demo

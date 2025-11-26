@@ -432,22 +432,31 @@ class AttentionProcessor:
         # Calculate total attention to vision tokens (image)
         vision_attention_sum = 0.0
         vision_token_positions = set()
+        vision_token_count = 0
         for start, end in self.vision_token_ranges['image']:
             vision_attention_sum += attention_from_token[start:end].sum().item()
             vision_token_positions.update(range(start, end))
+            vision_token_count += (end - start)
         for start, end in self.vision_token_ranges['video']:
             vision_attention_sum += attention_from_token[start:end].sum().item()
             vision_token_positions.update(range(start, end))
+            vision_token_count += (end - start)
         
         # Calculate attention to prompt text tokens (input tokens that are not vision tokens)
         # Only consider tokens within input_length (exclude generated tokens)
         prompt_text_attention_sum = 0.0
+        prompt_text_token_count = 0
         for pos in range(min(input_length, len(attention_from_token))):
             if pos not in vision_token_positions:
                 prompt_text_attention_sum += attention_from_token[pos].item()
+                prompt_text_token_count += 1
         
         # Calculate total attention within input range
         total_attention_in_input = vision_attention_sum + prompt_text_attention_sum
+        
+        # Calculate average attention per token
+        avg_vision_attention = vision_attention_sum / vision_token_count if vision_token_count > 0 else 0.0
+        avg_text_attention = prompt_text_attention_sum / prompt_text_token_count if prompt_text_token_count > 0 else 0.0
         
         # Calculate percentages
         if total_attention_in_input > 0:
@@ -457,10 +466,20 @@ class AttentionProcessor:
             image_percentage = 0.0
             prompt_text_percentage = 0.0
         
+        # Debug logging
+        print(f"[get_attention_distribution] Token counts: Vision={vision_token_count}, Prompt Text={prompt_text_token_count}")
+        print(f"[get_attention_distribution] Attention sums: Vision={vision_attention_sum:.4f}, Prompt Text={prompt_text_attention_sum:.4f}")
+        print(f"[get_attention_distribution] Average attention per token: Vision={avg_vision_attention:.6f}, Prompt Text={avg_text_attention:.6f}")
+        print(f"[get_attention_distribution] Percentages: Image={image_percentage:.1f}%, Prompt Text={prompt_text_percentage:.1f}%")
+        
         return {
             'image_percentage': image_percentage,
             'prompt_text_percentage': prompt_text_percentage,
-            'total_attention_in_input': total_attention_in_input
+            'total_attention_in_input': total_attention_in_input,
+            'vision_token_count': vision_token_count,
+            'prompt_text_token_count': prompt_text_token_count,
+            'avg_vision_attention': avg_vision_attention,
+            'avg_text_attention': avg_text_attention
         }
 
     def get_sequence_info(self) -> Dict[str, Any]:
@@ -486,6 +505,126 @@ class AttentionProcessor:
             'video_token_indices': self.video_token_indices,
             'vision_token_ranges': self.vision_token_ranges
         }
+
+    def get_sliding_window_attention_maps(
+        self,
+        attention_weights: Dict[int, Dict[int, Dict[int, torch.Tensor]]],
+        generated_token_positions: List[int],
+        window_size: int = 3,
+        layer_indices: Optional[List[int]] = None,
+        head_indices: Optional[List[int]] = None,
+        aggregation_method: str = "mean",
+        image_idx: int = 0,
+        normalize: bool = True
+    ) -> List[Tuple[List[int], np.ndarray]]:
+        """
+        使用滑动窗口计算生成token的注意力热力图。
+        
+        对于生成的token序列，使用长度为window_size的滑动窗口，
+        每个窗口内的token注意力进行平均，得到一个热力图。
+        
+        Args:
+            attention_weights: 完整的注意力权重字典
+                可以是两种格式：
+                1. {layer_idx: {head_idx: tensor}} - 旧格式
+                2. {step_key: {layer_idx: {head_idx: tensor}}} - 新格式（按生成步骤）
+            generated_token_positions: 生成的token位置列表
+            window_size: 滑动窗口大小（默认3）
+            layer_indices: 要使用的层索引
+            head_indices: 要使用的头索引
+            aggregation_method: 聚合方法
+            image_idx: 图像索引
+            normalize: 是否归一化
+            
+        Returns:
+            List of (window_positions, attention_map) tuples
+            每个元组包含窗口内的token位置列表和对应的注意力热力图
+        """
+        print(f"[get_sliding_window_attention_maps] Processing {len(generated_token_positions)} generated tokens")
+        print(f"[get_sliding_window_attention_maps] Window size: {window_size}")
+        
+        if len(generated_token_positions) < window_size:
+            print(f"[get_sliding_window_attention_maps] WARNING: Not enough tokens ({len(generated_token_positions)}) for window size {window_size}")
+            window_size = len(generated_token_positions)
+        
+        # 检测attention_weights的格式
+        is_step_based = False
+        if attention_weights:
+            first_key = next(iter(attention_weights))
+            first_value = attention_weights[first_key]
+            # 如果第一层的值还是dict，说明是step-based格式
+            if isinstance(first_value, dict) and first_value:
+                second_key = next(iter(first_value))
+                if isinstance(first_value[second_key], dict):
+                    is_step_based = True
+        
+        print(f"[get_sliding_window_attention_maps] Attention format: {'step-based' if is_step_based else 'layer-based'}")
+        
+        results = []
+        
+        # 滑动窗口遍历生成的tokens
+        for i in range(len(generated_token_positions) - window_size + 1):
+            window_positions = generated_token_positions[i:i+window_size]
+            print(f"\n[get_sliding_window_attention_maps] Window {i}: positions {window_positions}")
+            
+            # 收集窗口内所有token的注意力
+            window_vision_attentions = []
+            
+            for token_pos in window_positions:
+                # 根据格式获取该token的注意力
+                if is_step_based:
+                    # 新格式：需要获取对应步骤的注意力
+                    step_key = token_pos
+                    if step_key in attention_weights:
+                        step_attention = attention_weights[step_key]
+                    else:
+                        # 尝试找到最近的步骤
+                        available_steps = sorted(attention_weights.keys())
+                        if available_steps:
+                            step_key = min(available_steps, key=lambda x: abs(x - token_pos))
+                            step_attention = attention_weights[step_key]
+                            print(f"[get_sliding_window_attention_maps] Using closest step {step_key} for token {token_pos}")
+                        else:
+                            continue
+                else:
+                    # 旧格式：直接使用
+                    step_attention = attention_weights
+                
+                # 获取该token对视觉token的注意力
+                vision_attention = self.get_attention_to_vision_tokens(
+                    step_attention,
+                    token_pos,
+                    layer_indices,
+                    head_indices,
+                    aggregation_method
+                )
+                
+                if vision_attention is not None:
+                    window_vision_attentions.append(vision_attention)
+            
+            if not window_vision_attentions:
+                print(f"[get_sliding_window_attention_maps] WARNING: No attention found for window {i}")
+                continue
+            
+            # 对窗口内的注意力求平均
+            avg_vision_attention = torch.stack(window_vision_attentions).mean(dim=0)
+            print(f"[get_sliding_window_attention_maps] Averaged {len(window_vision_attentions)} attentions, shape: {avg_vision_attention.shape}")
+            
+            # 创建2D注意力热力图
+            attention_map = self.create_attention_map(
+                avg_vision_attention,
+                image_idx,
+                normalize
+            )
+            
+            if attention_map is not None:
+                results.append((window_positions, attention_map))
+                print(f"[get_sliding_window_attention_maps] Created attention map for window {i}, shape: {attention_map.shape}")
+            else:
+                print(f"[get_sliding_window_attention_maps] WARNING: Failed to create attention map for window {i}")
+        
+        print(f"\n[get_sliding_window_attention_maps] Total windows processed: {len(results)}")
+        return results
 
 
 def create_attention_processor(
