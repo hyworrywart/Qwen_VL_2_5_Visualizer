@@ -308,6 +308,60 @@ def create_attention_mask_visualization(
     return mask
 
 
+def get_prompt_text_token_positions(
+    input_ids: torch.Tensor,
+    tokenizer,
+    vision_token_ranges: Dict[str, List[Tuple[int, int]]]
+) -> List[Tuple[int, str]]:
+    """
+    Extract prompt text token positions and their text, excluding vision and special tokens.
+    
+    Args:
+        input_ids: Input token IDs tensor (batch_size, seq_len) or (seq_len,)
+        tokenizer: Tokenizer instance
+        vision_token_ranges: Dictionary with 'image' and 'video' token ranges
+        
+    Returns:
+        List of (position, token_text) tuples for prompt text tokens
+    """
+    # Flatten if batch dimension exists
+    if input_ids.dim() == 2:
+        input_ids = input_ids[0]
+    
+    # Build set of vision token positions
+    vision_positions = set()
+    for start, end in vision_token_ranges.get('image', []):
+        vision_positions.update(range(start, end))
+    for start, end in vision_token_ranges.get('video', []):
+        vision_positions.update(range(start, end))
+    
+    # Get special token IDs to exclude
+    special_ids = {
+        config.VISION_START_TOKEN_ID,
+        config.VISION_END_TOKEN_ID,
+        config.IMAGE_TOKEN_ID,
+        config.VIDEO_TOKEN_ID,
+    }
+    
+    # Add tokenizer special tokens if available
+    if hasattr(tokenizer, 'bos_token_id') and tokenizer.bos_token_id is not None:
+        special_ids.add(tokenizer.bos_token_id)
+    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
+        special_ids.add(tokenizer.eos_token_id)
+    if hasattr(tokenizer, 'pad_token_id') and tokenizer.pad_token_id is not None:
+        special_ids.add(tokenizer.pad_token_id)
+    
+    # Extract prompt text tokens
+    prompt_positions = []
+    for pos in range(len(input_ids)):
+        token_id = input_ids[pos].item()
+        if pos not in vision_positions and token_id not in special_ids:
+            token_text = tokenizer.decode([token_id], skip_special_tokens=False)
+            prompt_positions.append((pos, token_text))
+    
+    return prompt_positions
+
+
 def log_attention_info(
     attention_weights: Dict[int, Dict[int, torch.Tensor]],
     verbose: bool = True

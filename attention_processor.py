@@ -53,6 +53,9 @@ class AttentionProcessor:
             self.patch_mapping = self._create_patch_mapping()
         else:
             self.patch_mapping = None
+        
+        # Store prompt text token info (will be populated later)
+        self.prompt_text_tokens = None
 
     def _calculate_vision_token_ranges(self) -> Dict[str, Tuple[int, int]]:
         """
@@ -481,6 +484,103 @@ class AttentionProcessor:
             'avg_vision_attention': avg_vision_attention,
             'avg_text_attention': avg_text_attention
         }
+
+    def set_prompt_text_tokens(self, tokenizer):
+        """
+        Extract and store prompt text token positions and their text.
+        
+        Args:
+            tokenizer: Tokenizer instance for decoding
+        """
+        self.prompt_text_tokens = utils.get_prompt_text_token_positions(
+            self.input_ids,
+            tokenizer,
+            self.vision_token_ranges
+        )
+        
+        if config.VERBOSE:
+            print(f"[AttentionProcessor] Found {len(self.prompt_text_tokens)} prompt text tokens")
+    
+    def get_prompt_text_token_info(self) -> Optional[List[Tuple[int, str]]]:
+        """
+        Get prompt text token positions and their decoded text.
+        
+        Returns:
+            List of (position, token_text) tuples, or None if not yet extracted
+        """
+        return self.prompt_text_tokens
+    
+    def get_prompt_token_attention_heatmap(
+        self,
+        attention_weights: Dict[int, Dict[int, Dict[int, torch.Tensor]]],
+        prompt_token_position: int,
+        layer_indices: Optional[List[int]] = None,
+        head_indices: Optional[List[int]] = None,
+        aggregation_method: str = "mean",
+        image_idx: int = 0,
+        normalize: bool = True
+    ) -> Optional[np.ndarray]:
+        """
+        Get attention heatmap for a prompt text token to image regions.
+        
+        This uses the prefill attention (first generation step) where prompt tokens
+        attend to all input tokens including vision tokens.
+        
+        Args:
+            attention_weights: Full attention weights dict (step-based format)
+                {step_key: {layer_idx: {head_idx: attention_tensor}}}
+            prompt_token_position: Position of the prompt token in input sequence
+            layer_indices: Specific layers to use
+            head_indices: Specific heads to use
+            aggregation_method: How to aggregate attention
+            image_idx: Index of the image
+            normalize: Whether to normalize attention values
+            
+        Returns:
+            2D numpy array representing attention heatmap
+        """
+        print(f"[get_prompt_token_attention_heatmap] Processing prompt token at position {prompt_token_position}")
+        
+        # Get the prefill step (first generation step with full input sequence)
+        # The step key is the input length (full input sequence)
+        input_length = self.input_ids.shape[1] if self.input_ids.dim() == 2 else len(self.input_ids)
+        prefill_step_key = input_length
+        
+        print(f"[get_prompt_token_attention_heatmap] Input length: {input_length}")
+        print(f"[get_prompt_token_attention_heatmap] Looking for prefill step key: {prefill_step_key}")
+        print(f"[get_prompt_token_attention_heatmap] Available step keys: {sorted(attention_weights.keys())}")
+        
+        # Get attention for the prefill step
+        if prefill_step_key not in attention_weights:
+            print(f"[get_prompt_token_attention_heatmap] WARNING: Prefill step {prefill_step_key} not found")
+            # Try to find the closest step (should be the first/smallest step)
+            available_steps = sorted(attention_weights.keys())
+            if available_steps:
+                prefill_step_key = available_steps[0]
+                print(f"[get_prompt_token_attention_heatmap] Using first available step: {prefill_step_key}")
+            else:
+                print(f"[get_prompt_token_attention_heatmap] ERROR: No attention data available")
+                return None
+        
+        step_attention = attention_weights[prefill_step_key]
+        
+        # Get attention heatmap using existing method
+        attention_map = self.get_attention_heatmap_for_token(
+            step_attention,
+            token_position=prompt_token_position,
+            layer_indices=layer_indices,
+            head_indices=head_indices,
+            aggregation_method=aggregation_method,
+            image_idx=image_idx,
+            normalize=normalize
+        )
+        
+        if attention_map is None:
+            print(f"[get_prompt_token_attention_heatmap] ERROR: Failed to create attention map")
+            return None
+        
+        print(f"[get_prompt_token_attention_heatmap] Successfully created attention map with shape: {attention_map.shape}")
+        return attention_map
 
     def get_sequence_info(self) -> Dict[str, Any]:
         """

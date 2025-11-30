@@ -39,6 +39,7 @@ class ModelState:
         self.current_image_grid_thw = None
         self.generated_text = None
         self.generated_ids = None  # 添加：存储完整的生成序列
+        self.current_prompt_tokens = None  # 添加：存储问题文本tokens
 
     def reset(self):
         """Reset generation-specific state."""
@@ -49,6 +50,7 @@ class ModelState:
         self.current_image_grid_thw = None
         self.generated_text = None
         self.generated_ids = None
+        self.current_prompt_tokens = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -245,6 +247,13 @@ def generate_with_attention(
             original_image_size=(image.width, image.height),
             resized_image_size=None  # Will be inferred
         )
+        
+        # Extract and store prompt text tokens
+        state.current_processor.set_prompt_text_tokens(state.tokenizer)
+        prompt_token_info = state.current_processor.get_prompt_text_token_info()
+        if prompt_token_info:
+            state.current_prompt_tokens = [text for _, text in prompt_token_info]
+            print(f"Extracted {len(state.current_prompt_tokens)} prompt text tokens")
 
         # Log info
         if config.VERBOSE:
@@ -417,6 +426,125 @@ def visualize_token_range_attention(
         
     except Exception as e:
         print(f"Error in visualization: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def visualize_prompt_token_attention(
+    token_start_idx: int,
+    token_end_idx: int,
+    aggregation_method: str,
+    colormap: str,
+    alpha: float
+) -> Optional[Dict]:
+    """
+    Visualize attention from prompt text tokens to image regions.
+    Returns attention maps for all layers + 1 mean map.
+    
+    Args:
+        token_start_idx: Start token index (inclusive)
+        token_end_idx: End token index (inclusive)
+        aggregation_method: How to aggregate attention heads (mean/max/min)
+        colormap: Colormap name
+        alpha: Overlay transparency
+        
+    Returns:
+        Dictionary mapping layer names to attention heatmaps
+    """
+    if state.current_attention is None or state.current_processor is None:
+        print("Error: No attention data available. Please generate text first.")
+        return None
+    
+    if state.current_prompt_tokens is None or len(state.current_prompt_tokens) == 0:
+        print("Error: No prompt tokens available.")
+        return None
+    
+    # Get prompt token info
+    prompt_token_info = state.current_processor.get_prompt_text_token_info()
+    if not prompt_token_info:
+        print("Error: No prompt token info available.")
+        return None
+    
+    try:
+        print(f"Visualizing prompt token range: {token_start_idx} to {token_end_idx}")
+        
+        # Get available step keys - use the first step (prefill)
+        available_steps = sorted(state.current_attention.keys())
+        if not available_steps:
+            print("ERROR: No attention steps available")
+            return None
+        
+        prefill_step = available_steps[0]
+        step_attention = state.current_attention[prefill_step]
+        
+        # Get available layers and heads
+        available_layers = sorted(step_attention.keys())
+        if not available_layers:
+            print("ERROR: No layers available")
+            return None
+        
+        sample_layer = available_layers[0]
+        available_heads = sorted(step_attention[sample_layer].keys())
+        
+        print(f"Using prefill step: {prefill_step}")
+        print(f"Available layers: {available_layers}")
+        print(f"Available heads: {available_heads}")
+        
+        # Collect attention maps per layer for all prompt tokens in range
+        layer_attention_maps = {}
+        
+        for token_idx in range(token_start_idx, token_end_idx + 1):
+            if token_idx >= len(prompt_token_info):
+                continue
+            
+            prompt_position, token_text = prompt_token_info[token_idx]
+            print(f"Processing prompt token {token_idx}: position={prompt_position}, text='{token_text}'")
+            
+            # For each layer, get attention map
+            for layer_idx in available_layers:
+                # Get attention heatmap for this prompt token and this layer
+                attention_map = state.current_processor.get_prompt_token_attention_heatmap(
+                    state.current_attention,
+                    prompt_token_position=prompt_position,
+                    layer_indices=[layer_idx],  # Single layer
+                    head_indices=available_heads,  # All heads
+                    aggregation_method=aggregation_method.lower(),
+                    image_idx=0,
+                    normalize=True
+                )
+                
+                if attention_map is not None:
+                    if layer_idx not in layer_attention_maps:
+                        layer_attention_maps[layer_idx] = []
+                    layer_attention_maps[layer_idx].append(attention_map)
+        
+        if not layer_attention_maps:
+            print("ERROR: No attention maps generated for the prompt token range")
+            return None
+        
+        print(f"Successfully generated attention maps for {len(layer_attention_maps)} layers")
+        
+        # Average attention maps across tokens for each layer
+        layer_averaged_maps = {}
+        for layer_idx, maps in layer_attention_maps.items():
+            layer_averaged_maps[layer_idx] = np.mean(maps, axis=0)
+        
+        # Calculate mean across all layers
+        all_layers_mean = np.mean(list(layer_averaged_maps.values()), axis=0)
+        
+        # Return a dictionary with layer indices as keys
+        sorted_layers = sorted(layer_averaged_maps.keys())
+        result_dict = {}
+        for layer_idx in sorted_layers:
+            result_dict[f"Layer {layer_idx}"] = layer_averaged_maps[layer_idx]
+        result_dict["Mean (All Layers)"] = all_layers_mean
+        
+        print(f"Visualization created successfully! Generated attention maps for {len(result_dict)} layers")
+        return result_dict
+        
+    except Exception as e:
+        print(f"Error in prompt token visualization: {str(e)}")
         import traceback
         traceback.print_exc()
         return None
@@ -818,6 +946,96 @@ def generate_token_range_display_html(tokens, start_idx=None, end_idx=None, clic
                 css_class += " start"
         
         html_parts.append(f'<div class="{css_class}"><span class="token-idx-range">[{i}]</span>{token_escaped}</div>')
+    
+    html_parts.append('</div>')
+    
+    return ''.join(html_parts)
+
+
+def generate_prompt_token_display_html(tokens, start_idx=None, end_idx=None):
+    """
+    Generate HTML for prompt token display.
+    
+    Args:
+        tokens: List of token strings
+        start_idx: Start index of selection
+        end_idx: End index of selection
+        
+    Returns:
+        HTML string with token display
+    """
+    if not tokens:
+        return "<p style='color: gray;'>No prompt tokens to display</p>"
+    
+    html_parts = []
+    html_parts.append("""
+    <style>
+        .prompt-token-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 15px;
+            background-color: #f0f8ff;
+            border-radius: 8px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        .prompt-token-btn {
+            padding: 8px 14px;
+            border: 2px solid #d0e8ff;
+            border-radius: 6px;
+            background-color: white;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            transition: all 0.2s ease;
+        }
+        .prompt-token-btn.start,
+        .prompt-token-btn.end {
+            background-color: #ff6b6b;
+            color: white;
+            border-color: #ff5252;
+            font-weight: bold;
+        }
+        .prompt-token-btn.in-range {
+            background-color: #ffe5e5;
+            color: #d32f2f;
+            border-color: #ffcccc;
+        }
+        .prompt-token-idx {
+            font-size: 10px;
+            color: #6c757d;
+            margin-right: 6px;
+        }
+        .prompt-token-btn.start .prompt-token-idx,
+        .prompt-token-btn.end .prompt-token-idx {
+            color: #ffffff;
+        }
+        .prompt-token-btn.in-range .prompt-token-idx {
+            color: #d32f2f;
+        }
+    </style>
+    """)
+    
+    if start_idx is not None and end_idx is not None:
+        html_parts.append('<p style="margin-bottom: 10px; padding: 10px; background-color: #fff3e0; border-left: 4px solid #ff6b6b; border-radius: 4px;">✓ Prompt token range selected</p>')
+    else:
+        html_parts.append('<p style="margin-bottom: 10px; padding: 10px; background-color: #fff3e0; border-left: 4px solid #ff6b6b; border-radius: 4px;">💡 Select prompt token range using sliders below</p>')
+    
+    html_parts.append('<div class="prompt-token-grid">')
+    
+    for i, token in enumerate(tokens):
+        token_escaped = token.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        
+        css_class = "prompt-token-btn"
+        if start_idx is not None and end_idx is not None:
+            if i == start_idx:
+                css_class += " start"
+            elif i == end_idx:
+                css_class += " end"
+            elif min(start_idx, end_idx) < i < max(start_idx, end_idx):
+                css_class += " in-range"
+        
+        html_parts.append(f'<div class="{css_class}"><span class="prompt-token-idx">[{i}]</span>{token_escaped}</div>')
     
     html_parts.append('</div>')
     
@@ -1402,6 +1620,111 @@ def create_interface():
                         )
                         output_viz_4 = gr.Image(label="Frame 4", type="pil", height=300)
 
+        # =====================================================================
+        # Prompt Token Attention Visualization Section
+        # =====================================================================
+        gr.Markdown("---")
+        with gr.Accordion("### 📝 Step 3B: Visualize Prompt Text → Image Attention (Optional)", open=False):
+            gr.Markdown("""
+            Visualize how prompt/question text tokens attend to different image regions.
+            This uses the prefill attention from the first forward pass.
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("#### Select Prompt Tokens")
+                    
+                    # Token range selectors for prompt tokens
+                    with gr.Row():
+                        prompt_token_start = gr.Slider(
+                            minimum=0,
+                            maximum=10,
+                            value=0,
+                            step=1,
+                            label="Start Index",
+                            interactive=True
+                        )
+                        prompt_token_end = gr.Slider(
+                            minimum=0,
+                            maximum=10,
+                            value=0,
+                            step=1,
+                            label="End Index",
+                            interactive=True
+                        )
+                    
+                    # Token display
+                    prompt_token_display = gr.HTML(
+                        value="<p style='color: gray;'>Generate text first to see prompt tokens</p>"
+                    )
+                    
+                    with gr.Accordion("Attention Settings", open=True):
+                        prompt_aggregation = gr.Radio(
+                            ["Mean", "Max", "Min"],
+                            value="Mean",
+                            label="Head Aggregation Method",
+                            info="How to aggregate attention across multiple heads"
+                        )
+                    
+                    with gr.Accordion("Visualization Settings", open=False):
+                        prompt_colormap = gr.Dropdown(
+                            ["jet", "hot", "viridis", "plasma", "coolwarm", "magma"],
+                            value="jet",
+                            label="Colormap"
+                        )
+                        prompt_alpha = gr.Slider(
+                            0.0, 1.0, value=0.5, step=0.05,
+                            label="Overlay Transparency"
+                        )
+                    
+                    visualize_prompt_btn = gr.Button("Visualize Prompt Tokens", variant="primary", size="lg")
+                
+                with gr.Column(scale=2):
+                    gr.Markdown("#### 🎨 Prompt Token Attention Visualization (2×2 Grid)")
+                    
+                    # Attention distribution display for prompt tokens
+                    prompt_attention_dist_display = gr.HTML(
+                        value="<div style='padding: 10px; color: gray; text-align: center;'>Click 'Visualize Prompt Tokens' to see attention distribution</div>",
+                        label=None
+                    )
+                    
+                    with gr.Row():
+                        with gr.Column():
+                            prompt_layer_select_1 = gr.Dropdown(
+                                choices=[],
+                                label="Select Layer for Frame 1",
+                                value=None,
+                                interactive=True
+                            )
+                            prompt_output_viz_1 = gr.Image(label="Frame 1", type="pil", height=300)
+                        
+                        with gr.Column():
+                            prompt_layer_select_2 = gr.Dropdown(
+                                choices=[],
+                                label="Select Layer for Frame 2",
+                                value=None,
+                                interactive=True
+                            )
+                            prompt_output_viz_2 = gr.Image(label="Frame 2", type="pil", height=300)
+                    
+                    with gr.Row():
+                        with gr.Column():
+                            prompt_layer_select_3 = gr.Dropdown(
+                                choices=[],
+                                label="Select Layer for Frame 3",
+                                value=None,
+                                interactive=True
+                            )
+                            prompt_output_viz_3 = gr.Image(label="Frame 3", type="pil", height=300)
+                        
+                        with gr.Column():
+                            prompt_layer_select_4 = gr.Dropdown(
+                                choices=[],
+                                label="Select Layer for Frame 4",
+                                value=None,
+                                interactive=True
+                            )
+                            prompt_output_viz_4 = gr.Image(label="Frame 4", type="pil", height=300)
 
         # Event handlers
         load_btn.click(
@@ -1410,12 +1733,39 @@ def create_interface():
             outputs=load_status
         )
 
+        # Update generate button to also update prompt token sliders
+        def generate_wrapper(image, prompt, content_order, max_tokens, temperature, top_p):
+            result = generate_with_attention(image, prompt, content_order, max_tokens, temperature, top_p)
+            
+            # Update prompt token sliders based on extracted prompt tokens
+            if state.current_prompt_tokens and len(state.current_prompt_tokens) > 0:
+                num_prompt_tokens = len(state.current_prompt_tokens)
+                prompt_slider_max = num_prompt_tokens - 1
+                initial_prompt_end = min(3, num_prompt_tokens - 1)  # Default to first 4 tokens or less
+                
+                prompt_start_update = gr.update(maximum=prompt_slider_max, value=0)
+                prompt_end_update = gr.update(maximum=prompt_slider_max, value=initial_prompt_end)
+                
+                # Generate initial prompt token display
+                prompt_html = generate_prompt_token_display_html(
+                    state.current_prompt_tokens, 
+                    start_idx=0, 
+                    end_idx=initial_prompt_end
+                )
+            else:
+                prompt_start_update = gr.update()
+                prompt_end_update = gr.update()
+                prompt_html = "<p style='color: gray;'>No prompt tokens available</p>"
+            
+            return result + (prompt_start_update, prompt_end_update, prompt_html)
+        
         generate_btn.click(
-            fn=generate_with_attention,
+            fn=generate_wrapper,
             inputs=[image_input, prompt_input, content_order, max_tokens, temperature, top_p],
             outputs=[output_text, gen_status,
                     token_display,
-                    token_index, token_range_start, token_range_end]
+                    token_index, token_range_start, token_range_end,
+                    prompt_token_start, prompt_token_end, prompt_token_display]
         )
         
         # Toggle visibility based on selection mode
@@ -1616,6 +1966,237 @@ def create_interface():
             ],
             outputs=[video_output, video_status]
         )
+        
+        # =====================================================================
+        # Prompt Token Attention Event Handlers
+        # =====================================================================
+        
+        # Update prompt token display when sliders change
+        def update_prompt_token_display(start, end):
+            if state.current_prompt_tokens is None:
+                return "<p style='color: gray;'>No prompt tokens available</p>"
+            start_idx = int(start) if start is not None else 0
+            end_idx = int(end) if end is not None else 0
+            return generate_prompt_token_display_html(state.current_prompt_tokens, start_idx, end_idx)
+        
+        prompt_token_start.change(
+            fn=update_prompt_token_display,
+            inputs=[prompt_token_start, prompt_token_end],
+            outputs=[prompt_token_display]
+        )
+        
+        prompt_token_end.change(
+            fn=update_prompt_token_display,
+            inputs=[prompt_token_start, prompt_token_end],
+            outputs=[prompt_token_display]
+        )
+        
+        # Visualize prompt token attention
+        def visualize_prompt_attention_unified(
+            token_start_idx: int,
+            token_end_idx: int,
+            aggregation_method: str,
+            colormap: str,
+            alpha: float
+        ):
+            """Unified visualization function for prompt tokens."""
+            global current_attention_maps
+            
+            if state.current_prompt_tokens is None or len(state.current_prompt_tokens) == 0:
+                print("ERROR: No prompt tokens available")
+                return (None, None, None, None, 
+                        gr.update(), gr.update(), gr.update(), gr.update(), 
+                        "<div style='color: gray;'>No prompt tokens available</div>")
+            
+            try:
+                token_start_idx = int(token_start_idx)
+                token_end_idx = int(token_end_idx)
+                
+                if token_start_idx > token_end_idx:
+                    print("WARNING: Start token is after end token, swapping them")
+                    token_start_idx, token_end_idx = token_end_idx, token_start_idx
+                
+                # Use prompt token visualization
+                attention_maps = visualize_prompt_token_attention(
+                    token_start_idx=token_start_idx,
+                    token_end_idx=token_end_idx,
+                    aggregation_method=aggregation_method,
+                    colormap=colormap,
+                    alpha=alpha
+                )
+            except Exception as e:
+                print(f"ERROR: Failed to visualize prompt tokens: {e}")
+                import traceback
+                traceback.print_exc()
+                return (None, None, None, None, 
+                        gr.update(), gr.update(), gr.update(), gr.update(), 
+                        "<div style='color: gray;'>Error during visualization</div>")
+            
+            if attention_maps is None:
+                return (None, None, None, None, 
+                        gr.update(), gr.update(), gr.update(), gr.update(), 
+                        "<div style='color: gray;'>No attention data available</div>")
+            
+            # Store attention maps globally
+            current_attention_maps = attention_maps
+            
+            # Calculate attention distribution for prompt tokens
+            prompt_token_info = state.current_processor.get_prompt_text_token_info()
+            if not prompt_token_info:
+                dist_html = "<div style='padding: 10px; color: gray;'>No attention distribution available</div>"
+            else:
+                # Get prefill step
+                available_steps = sorted(state.current_attention.keys())
+                prefill_step = available_steps[0] if available_steps else None
+                
+                if prefill_step and prefill_step in state.current_attention:
+                    step_attention = state.current_attention[prefill_step]
+                    available_layers = sorted(step_attention.keys())
+                    sample_layer = available_layers[0] if available_layers else None
+                    available_heads = sorted(step_attention[sample_layer].keys()) if sample_layer is not None else []
+                    
+                    # Calculate average distribution for selected prompt tokens
+                    distributions = []
+                    input_length = state.current_input_ids.shape[1]
+                    
+                    for token_idx in range(token_start_idx, token_end_idx + 1):
+                        if token_idx >= len(prompt_token_info):
+                            continue
+                        
+                        prompt_position, _ = prompt_token_info[token_idx]
+                        
+                        dist = state.current_processor.get_attention_distribution(
+                            step_attention,
+                            token_position=prompt_position,
+                            input_length=input_length,
+                            layer_indices=available_layers,
+                            head_indices=available_heads,
+                            aggregation_method="mean"
+                        )
+                        if dist:
+                            distributions.append(dist)
+                    
+                    # Average the distributions
+                    if distributions:
+                        avg_image = sum(d['image_percentage'] for d in distributions) / len(distributions)
+                        avg_prompt_text = sum(d['prompt_text_percentage'] for d in distributions) / len(distributions)
+                        dist_html = f"""
+                        <div style="padding: 10px; background: #fff3e0; border-radius: 5px; margin: 10px 0; border: 1px solid #ffb74d;">
+                            <div style="font-size: 14px; color: #333; line-height: 1.8;">
+                                <strong>Prompt Token Attention Distribution:</strong><br>
+                                Image: <span style="color: #1976d2; font-weight: bold;">{avg_image:.1f}%</span> | 
+                                Other Prompt Text: <span style="color: #388e3c; font-weight: bold;">{avg_prompt_text:.1f}%</span>
+                            </div>
+                        </div>
+                        """
+                    else:
+                        dist_html = "<div style='padding: 10px; color: gray;'>No attention distribution available</div>"
+                else:
+                    dist_html = "<div style='padding: 10px; color: gray;'>No attention distribution available</div>"
+            
+            # Get layer choices
+            layer_choices = sorted([k for k in attention_maps.keys() if k.startswith("Layer")], 
+                                  key=lambda x: int(x.split()[1]))
+            layer_choices.append("Mean (All Layers)")
+            
+            # Create default visualizations for 4 frames
+            visualizer = AttentionVisualizer(colormap=colormap, alpha=alpha)
+            
+            default_layers = [
+                "Mean (All Layers)",  # Frame 1 - top left
+                "Layer 0",            # Frame 2 - top right
+                "Layer 14",           # Frame 3 - bottom left
+                "Layer 27"            # Frame 4 - bottom right
+            ]
+            
+            images = []
+            for layer_name in default_layers:
+                if layer_name in attention_maps:
+                    img = visualizer.create_heatmap_overlay(
+                        state.current_image,
+                        attention_maps[layer_name]
+                    )
+                    images.append(img)
+                else:
+                    images.append(None)
+            
+            # Update dropdowns with layer choices and set default values
+            dropdown_updates = [gr.update(choices=layer_choices, value=default_layers[i]) for i in range(4)]
+            
+            return (images[0], images[1], images[2], images[3],
+                    dropdown_updates[0], dropdown_updates[1], dropdown_updates[2], dropdown_updates[3],
+                    dist_html)
+        
+        visualize_prompt_btn.click(
+            fn=visualize_prompt_attention_unified,
+            inputs=[
+                prompt_token_start, prompt_token_end,
+                prompt_aggregation, prompt_colormap, prompt_alpha
+            ],
+            outputs=[
+                prompt_output_viz_1, prompt_output_viz_2, prompt_output_viz_3, prompt_output_viz_4,
+                prompt_layer_select_1, prompt_layer_select_2, prompt_layer_select_3, prompt_layer_select_4,
+                prompt_attention_dist_display
+            ]
+        )
+        
+        # Add event handlers for prompt layer selection dropdowns
+        def update_prompt_frame_1(layer_name, cmap, a):
+            return create_layer_visualization(layer_name, cmap, a)
+        
+        def update_prompt_frame_2(layer_name, cmap, a):
+            return create_layer_visualization(layer_name, cmap, a)
+        
+        def update_prompt_frame_3(layer_name, cmap, a):
+            return create_layer_visualization(layer_name, cmap, a)
+        
+        def update_prompt_frame_4(layer_name, cmap, a):
+            return create_layer_visualization(layer_name, cmap, a)
+        
+        prompt_layer_select_1.change(
+            fn=update_prompt_frame_1,
+            inputs=[prompt_layer_select_1, prompt_colormap, prompt_alpha],
+            outputs=prompt_output_viz_1
+        )
+        
+        prompt_layer_select_2.change(
+            fn=update_prompt_frame_2,
+            inputs=[prompt_layer_select_2, prompt_colormap, prompt_alpha],
+            outputs=prompt_output_viz_2
+        )
+        
+        prompt_layer_select_3.change(
+            fn=update_prompt_frame_3,
+            inputs=[prompt_layer_select_3, prompt_colormap, prompt_alpha],
+            outputs=prompt_output_viz_3
+        )
+        
+        prompt_layer_select_4.change(
+            fn=update_prompt_frame_4,
+            inputs=[prompt_layer_select_4, prompt_colormap, prompt_alpha],
+            outputs=prompt_output_viz_4
+        )
+        
+        # Update all prompt frames when colormap or alpha changes
+        def update_all_prompt_frames(cmap, a, l1, l2, l3, l4):
+            return (
+                create_layer_visualization(l1, cmap, a) if l1 else None,
+                create_layer_visualization(l2, cmap, a) if l2 else None,
+                create_layer_visualization(l3, cmap, a) if l3 else None,
+                create_layer_visualization(l4, cmap, a) if l4 else None
+            )
+        
+        prompt_colormap.change(
+            fn=update_all_prompt_frames,
+            inputs=[prompt_colormap, prompt_alpha, prompt_layer_select_1, prompt_layer_select_2, prompt_layer_select_3, prompt_layer_select_4],
+            outputs=[prompt_output_viz_1, prompt_output_viz_2, prompt_output_viz_3, prompt_output_viz_4]
+        )
+        
+        prompt_alpha.change(
+            fn=update_all_prompt_frames,
+            inputs=[prompt_colormap, prompt_alpha, prompt_layer_select_1, prompt_layer_select_2, prompt_layer_select_3, prompt_layer_select_4],
+            outputs=[prompt_output_viz_1, prompt_output_viz_2, prompt_output_viz_3, prompt_output_viz_4]
+        )
 
     return demo
 
@@ -1636,8 +2217,21 @@ if __name__ == "__main__":
 
     # Create and launch interface
     demo = create_interface()
-    demo.launch(
-        server_name=config.GRADIO_SERVER_NAME,
-        server_port=config.GRADIO_SERVER_PORT,
-        share=config.GRADIO_SHARE
-    )
+    try:
+        demo.launch(
+            server_name=config.GRADIO_SERVER_NAME,
+            server_port=config.GRADIO_SERVER_PORT,
+            share=config.GRADIO_SHARE
+        )
+    except ValueError as e:
+        if "localhost is not accessible" in str(e):
+            print("\n" + "="*60)
+            print("WARNING: Localhost not accessible. Launching with share=True")
+            print("="*60 + "\n")
+            demo.launch(
+                server_name=config.GRADIO_SERVER_NAME,
+                server_port=config.GRADIO_SERVER_PORT,
+                share=True
+            )
+        else:
+            raise
